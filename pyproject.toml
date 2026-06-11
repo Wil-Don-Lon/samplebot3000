@@ -1,0 +1,25 @@
+[project]
+name = "audio2inst"
+version = "0.1.0"
+description = "Turn any audio into a playable drum instrument via unsupervised clustering."
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "librosa>=0.10",
+    "scikit-learn>=1.3",
+]
+
+[project.scripts]
+samplebot-3000 = "main:main"
+audio2inst = "main:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "gui", "pipeline", "audio_engine", "piano_widget", "cluster_viewer", "adsr_widget"]
