@@ -1,8 +1,26 @@
 # Samplebot-3000
 
-Turn any audio file into a playable sampler instrument via unsupervised clustering. Point it at a recording — a drum loop, a field recording, a vocal take, an engine — and it slices the audio at every onset, fingerprints each slice by timbre, and groups the slices into clusters. Each cluster is mapped to a key, so acoustically similar sounds end up under the same note. Pick a wav/mp3/flac, hit Run, and play it with your computer keyboard. Includes an ADSR envelope, master lowpass filter, octave switching, velocity-layer crossfade, and a choice of three clustering algorithms.
+Turn any audio file into a playable drum-machine instrument. Point it at a
+recording — a drum loop, a break, a field recording — and it detects every
+transient, slices a sample from each, fingerprints it by timbre, and lays the
+samples out on a keyboard. Two ways to organize them:
 
-> The console script and Python package are still named `audio2inst` for backward compatibility; `samplebot-3000` is provided as an alias.
+- **Clustering** (unsupervised) — groups acoustically similar slices and maps
+  each group to a key. Three algorithms: KMeans, Agglomerative, HDBSCAN.
+- **Classification** (supervised) — a trained model labels each slice as a drum
+  type (kick, snare, hat, tom, clap, fx, …) and places it on a fixed
+  General-MIDI-style drum layout. Five models to choose from.
+
+Pick a wav/mp3/flac/aiff, choose Clustering or Classification, hit **Run**, and
+play it with your computer keyboard. Each key holds a set of samples you tab
+through with arrows, and every sample carries its own envelope, velocity,
+loop, and filter settings. A 16-step sequencer grid is wired for a coming
+step-sequencer mode.
+
+![Reference UI](reference.png)
+
+> The console script and Python package are still named `audio2inst` for
+> backward compatibility; `samplebot-3000` is the alias.
 
 ## Install
 
@@ -15,95 +33,168 @@ brew install portaudio
 Then from the project directory:
 
 ```bash
-uv venv && uv pip install -e .
-# or:
 python -m venv .venv && source .venv/bin/activate && pip install -e .
 ```
+
+The app expects its dependencies (PySide6, librosa, scikit-learn, sounddevice,
+scipy) in a `.venv` in the project directory.
 
 ## Run
 
 ```bash
-samplebot-3000
-# or the legacy alias:
-audio2inst
-# or directly:
 python main.py
 ```
 
+`main.py` **re-execs itself under the project `.venv`** if launched from another
+interpreter (e.g. a conda `base` env), so it always runs against the right audio
+stack and library versions. If no audio device can be opened the GUI still
+launches — it just runs silent so you can analyze without sound.
+
 ## Controls
+
+### Method toggle
+
+A segmented switch picks **CLUSTERING** or **CLASSIFICATION** — never both. The
+data-cleaning pipeline (transient detection, gate, trim, normalize) is identical
+for both; only the grouping step differs.
+
+- **CLUSTERING** → a **MODE** dropdown (KMeans / Agglomerative / HDBSCAN) and its
+  parameter. Each cluster becomes a key; no instrument labels.
+- **CLASSIFICATION** → a **MODEL** dropdown (SVM / Random Forest / k-NN /
+  Gradient Boost / Neural Net). Each slice is labeled and placed on the fixed
+  drum layout below.
 
 ### Analysis (left column)
 
-- **Mode** — three clustering algorithms:
-  - **Manual k (KMeans)** — you pick the cluster count (2–52). Always produces exactly k clusters; every segment belongs to one.
-  - **Auto threshold (Agglomerative)** — Ward-linkage hierarchical clustering. Threshold slider controls how close two clusters must be to merge. Lower threshold → tighter, more numerous clusters.
-  - **Auto density (HDBSCAN)** — density-based discovery. `min size` sets the smallest grouping considered a real cluster. Noise points get reassigned to their nearest cluster centroid so nothing is dropped.
-- **Sample length** (0.1–5.0 s) — how much audio to capture starting at each onset. Default 0.5s gives drum-machine behavior; raise to 2–3s for sustained sources (vocal notes, drones, engine recordings). Changing this requires a fresh Run to apply.
-- **Sensitivity** — onset detector threshold. Higher detects more transients (and more false positives). Only takes effect on the next Run.
-- **Run Analysis** / **View Clusters** — pipeline runs on a worker thread; cluster viewer opens after a successful run and lets you audition every segment.
+- **Sample Len** (0.1–5.0 s) — the maximum sample length captured from each
+  transient. Default 0.5s suits drums; raise it for sustained material.
+- **Transient Sens** — onset-detector sensitivity. Higher catches more (subtler)
+  transients; lower keeps only strong hits.
+- **Noise Gate** — a transient whose peak never rises above this level is
+  dropped entirely.
+- **Trim Threshold** — where a sample's tail ends: the sample runs from the
+  transient until its envelope decays below this level.
+- **Clip at Next** — when on, a sample also ends as soon as the next transient is
+  detected; when off it runs to the trim-threshold decay or the sample-length
+  cap, whichever comes first.
+- **Run Analysis** / **View Clusters** — the pipeline runs on a worker thread;
+  the cluster viewer opens after a run to audition every slice.
+- **Sequencer · 16 steps** — a clickable grid. Select a key, then light up the
+  steps where it should trigger. Patterns are stored per key. (Playback clock is
+  not wired yet — this is state for the coming step-sequencer mode.)
 
-### Playback (right column)
+### Playback — per sample (right column)
 
-- **Velocity** (1–127) — picks which segment plays within a cluster (low → quietest, high → loudest) **and** controls output gain. With velocity-layer crossfade, intermediate values play two adjacent segments with equal-power cos/sin weights so perceived loudness stays smooth across the velocity range.
-- **Loop while held** — when checked, voices loop their audio buffer back to the start as long as the envelope hasn't entered the release phase. Combined with a long Release in ADSR, this turns short slices into pad-like sustained notes. Affects voices created after toggling; in-flight notes keep their original setting.
-- **Envelope (ADSR)** — applied per-voice:
-  - **A** (0–1000 ms) — fade-in from silence
-  - **D** (0–1000 ms) — drop from peak to sustain level
-  - **S** (0–1.00) — held level during the body of the note
-  - **R** (0–2000 ms) — fade-out triggered when the key is released
-- **Filter** — 4th-order Butterworth lowpass on the master mix. Slider is logarithmic, 20 Hz to 20 kHz. At max, the filter is bypassed.
-- **Octave** — `Z` / `X` keys or the arrow buttons. Each octave is 13 keys; if clustering produces more than 13 clusters, the extras are reachable in higher octaves. The indicator shows current / max octave.
+Pressing a key **selects** it (amber outline + the ACTIVE light shows its name).
+The **◀ N / M ▶** selector tabs through that key's samples; the chosen sample is
+what plays. **Every playback control below applies to the currently selected
+sample** and is remembered per sample:
+
+- **Velocity** (1–127) — output volume plus a slight velocity-dependent lowpass
+  (softer hits are a touch darker).
+- **Loop** — loops the sample while the key is held.
+- **Envelope (ADSR)** — per-voice attack / decay / sustain / release.
+- **Filter** — per-voice lowpass cutoff (20 Hz – 20 kHz, log).
+- **Pitch Sort** / **Octave** — clustering-mode global controls (ordering and
+  multi-octave reach); not used by the fixed classification layout.
 
 ### Keyboard
 
+Computer keys `A W S E D F T G Y H U J K O L P ;` map to the visible octave.
+
+In **classification** mode the layout is a fixed drum kit:
+
 ```
-  W   E       T   Y   U
-A   S   D   F   G   H   J   K
-C   D   E   F   G   A   B   C
+key:  C   C#   D   D#   E    F   F#   G   G#   A   A#   B   C   C#   D    D#   E
+       Kick Snr1 Snr2 Clap Snr3 LoT HH1 MidT HH2 HiT HH3 FX1 FX2 Crash FX3 Ride FX4
 ```
 
-`Z` octave down, `X` octave up. Hold multiple keys for polyphony. Releasing a key triggers the release phase of the envelope.
+Drum types with several keys (snare, hats, fx) spread their samples round-robin
+across those keys.
 
-## How clustering works
+## Data pipeline
 
-Each onset gets a 0.5-second slice. That slice gets reduced to a 29-number fingerprint of its timbre — 13 MFCC means + 13 MFCC stds + spectral centroid (mean + std) + spectral rolloff mean. The features are z-score normalized so no single dimension dominates the geometry, then run through the chosen clustering algorithm. Finally, clusters are sorted by median spectral centroid (dark → bright) and assigned to keys in that order.
+```
+raw file
+  → detect transients above the noise gate
+  → for each: grab from the transient start until the signal falls below the
+    trim threshold, OR hits the sample-length cap, OR the next transient
+    (only if "Clip at Next" is on)
+  → normalize each sample (peak)
+  → cluster (KMeans/Agglomerative/HDBSCAN)  OR  classify (trained model)
+```
 
-MFCC clustering groups by **acoustic similarity**, not by source object. Two different objects that produce dull thuds will land in the same cluster.
+### Feature vector (57 dims)
+
+Each slice is reduced to a 57-number timbre fingerprint, used by both clustering
+and the classifier: 13 MFCC means + 13 MFCC stds + 13 MFCC-delta means + 12
+chroma + spectral centroid (mean/std), rolloff, bandwidth, flatness, and
+zero-crossing rate. Features are computed on a peak-normalized copy so loudness
+doesn't influence them.
+
+## Supervised classifier
+
+`classifier.py` trains/evaluates the drum-type models from the sorted
+`training data/` bins (kept out of the repo). The five models are saved to
+`models/*.joblib` and selected live in the GUI.
+
+```bash
+python classifier.py --extract            # build feature_cache.npz from the bins
+python classifier.py --compare            # 5-fold CV accuracy for all models
+python classifier.py --train --model gb   # train + save one model
+python classifier.py --predict file.wav --model gb
+```
+
+`model_analysis.py` runs an honest evaluation grouped by source drum machine
+(leave-one-machine-out) to expose train/serve skew and per-class weaknesses.
+
+Supporting data tools (operate on `training data/`, not needed to run the app):
+`sort_samples.py` (name-based bin sorter), `normalize_names.py` (rename/repack
+bins).
 
 ## Architecture
 
 ```
-main.py
+main.py                    (re-exec into .venv, then launch)
   └─ gui.py
-       ├─ pipeline.py        (worker QThread — pure data transform)
-       ├─ audio_engine.py    (OutputStream, ADSR voices, lowpass filter)
-       ├─ piano_widget.py    (paints one octave, signals on press/release)
-       ├─ cluster_viewer.py  (dialog: audition every segment in every key)
-       └─ adsr_widget.py     (envelope curve visualizer)
+       ├─ pipeline.py        (worker QThread — extract, cluster/classify, build)
+       ├─ audio_engine.py    (OutputStream; per-voice ADSR + per-voice lowpass)
+       ├─ piano_widget.py    (paints the octave; selection + key labels)
+       ├─ moog_widgets.py    (Knob, ToggleSwitch, LED, StepGrid)
+       ├─ cluster_viewer.py  (dialog: audition every slice in every key)
+       ├─ adsr_widget.py     (envelope curve visualizer)
+       └─ classifier.py      (load trained models for classification mode)
 ```
 
-- **pipeline.py** — `run_pipeline(path, mode, n_clusters | threshold | min_cluster_size, sensitivity)` → `Instrument`. Onset detect via librosa, MFCC + spectral features (29 dims), z-score normalize, cluster, sort by spectral centroid.
-- **audio_engine.py** — one OutputStream. Voices carry their own ADSR state machine (Attack → Decay → Sustain → Release → Done) and a `note_id`; `release_note(note_id)` transitions matching voices to release. Master lowpass is stateful across blocks.
-- **piano_widget.py** — paints exactly one octave; gui.py translates visible key → cluster index via the current octave.
-- **gui.py** — integrates everything. Velocity layering uses equal-power crossfade. Octave switching releases pressed keys to prevent stuck notes.
+- **pipeline.py** — `run_pipeline(path, mode, …, classifier_model, clip_at_next_onset)`
+  → `Instrument`. Transient detect (librosa) → gate/trim/normalize → 57-dim
+  features → cluster or classify → key assignment.
+- **audio_engine.py** — one OutputStream. Each voice captures its own ADSR and
+  lowpass cutoff at play time and is filtered independently, so per-sample
+  settings don't bleed across overlapping voices.
+- **gui.py** — per-sample `PlaybackSettings` are stored on each slice; selecting
+  a sample loads its settings into the controls, editing a control writes back,
+  and playing applies them.
 
 ## Roadmap / Future work
 
-The current build is a self-contained playable instrument. The next major direction is **DAW integration** — letting Samplebot-3000 export the instrument it builds so it can be used natively inside a host, instead of only from the app's own keyboard.
+- **Step sequencer playback.** The 16-step grid stores a pattern per key; next
+  is a transport/clock that triggers each key on its lit steps.
+- **Model tuning.** Improve classification: align training feature extraction
+  with the live pipeline's segmentation, add a pitch feature to separate
+  hi/mid/lo toms, and reconsider the catch-all `fx` class.
+- **Logic Pro / Sampler (EXS24) and SFZ export.** Serialize the built instrument
+  (per key: ordered slices + mapping) to native sampler formats so it plays in a
+  DAW without the Samplebot window.
+- **Plugin wrapper (AU/VST).** Longer term, ship the engine as an instrument
+  plugin.
 
-- **Logic Pro / Sampler (EXS24) export.** Write the clustered slices to disk as individual `.wav` files plus a `.exs` (or modern Sampler) instrument that maps each cluster to the correct key and velocity zone. The user could then load the result as a native Logic instrument, play it from a MIDI controller, and record it into a project — no Samplebot window required.
-- **General MIDI-instrument / SFZ export.** SFZ is an open, text-based sampler format supported across many DAWs and plugins (sforzando, Kontakt-adjacent tools, Decent Sampler, etc.). Emitting an `.sfz` alongside the rendered slices would make the instrument portable beyond a single host. This is likely the first export target because it is plain-text and trivial to generate from the existing key/velocity mapping.
-- **Ableton / generic drum-rack export.** Map clusters onto drum-rack pads for groove-box-style workflows.
-- **MIDI region export.** Optionally emit a MIDI clip that triggers the clusters in the order/timing of the original onsets, so the reconstructed performance can be dropped straight onto a track.
-- **Plugin wrapper (AU/VST).** Longer term, ship the engine as an instrument plugin so analysis and playback happen inside the DAW.
+## Notes
 
-The internal data model already produces exactly what these formats need — for each cluster: an ordered set of audio slices, a target key, and velocity layering — so export is primarily a serialization layer on top of `pipeline.Instrument`.
-
-## V2 design choices
-
-- **Velocity crossfade is mix-time, not time-domain.** When velocity lands between two layers, both segments are played simultaneously with weights `cos(frac · π/2)` and `sin(frac · π/2)`. This keeps perceived loudness constant across the velocity range. If you wanted a time-domain crossfade (sample A fades out as sample B fades in over the duration of the note), that's a different feature — let me know.
-- **HDBSCAN noise points are reassigned, not dropped.** Each noise-labeled segment is attached to the nearest cluster centroid in feature space.
-- **ADSR for one-shot samples is unusual.** Defaults are configured to be essentially transparent (A=0, D=0, S=1.0, R=50 ms): the sample plays normally, with a short fade-out on key release. Crank `A` for swells; crank `R` for long tails on sustained sources.
-- **Lowpass state resets when cutoff changes.** Rapid slider drags may produce subtle clicks. Acceptable for live exploration.
-- **Loops are naive.** When loop is on, the playhead wraps back to sample 0 with no crossfade at the seam. If your slice's first and last samples differ a lot, you'll hear a click at the loop point. Two ways to hide it: capture a longer slice (so loops happen less often), or use a long Release so the envelope is dropping while looping.
-- **Memory scales with sample length.** A 5-second slice at 44.1kHz mono is 882KB per segment; with hundreds of segments across many clusters this can add up. Drop the sample length back down if you don't need long captures.
+- **Velocity no longer selects the sample.** Sample choice is the arrow-tab
+  selector; velocity is volume + slight lowpass.
+- **Per-sample settings live on the slice**, so they survive pitch-sort
+  re-ordering in clustering mode.
+- **Loops are naive** (no crossfade at the seam) — capture a longer slice or use
+  a long release to hide the click.
+- **Memory scales with sample length** — a 5 s slice at 44.1 kHz mono is ~882 KB.

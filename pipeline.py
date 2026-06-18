@@ -81,6 +81,8 @@ class Segment:
     rms: float
     cluster: int = -1
     dominant_freq: float = 0.0   # FFT peak frequency, used for key ordering
+    label: str = ""              # predicted class (classification mode)
+    playback: object = None      # per-sample PlaybackSettings (set by the GUI)
 
 
 @dataclass
@@ -127,7 +129,9 @@ def detect_onsets(
     min_gap_s: float = MIN_ONSET_GAP_S,
 ) -> np.ndarray:
     sensitivity = float(np.clip(sensitivity, 0.0, 1.0))
-    delta = 0.12 - 0.10 * sensitivity
+    # Wider, more perceptible range: low sensitivity = high delta (only strong
+    # transients), high sensitivity = near-zero delta (catches subtle hits).
+    delta = 0.22 - 0.21 * sensitivity        # 0.22 .. 0.01
     onset_samples = librosa.onset.onset_detect(
         y=audio, sr=TARGET_SR, delta=delta, backtrack=True, units="samples",
     )
@@ -218,44 +222,80 @@ def dominant_frequency(audio: np.ndarray, sr: int = TARGET_SR) -> float:
     return float(freqs[int(strong[0])])
 
 
+def _tail_end_index(
+    chunk: np.ndarray,
+    threshold_db: float,
+) -> int:
+    """Index where the sample's tail falls below threshold and stays there.
+
+    Walks the smoothed envelope from the transient (start of chunk) forward and
+    returns the last index that is still at or above the trim threshold + 1.
+    Unlike trim_silence this never trims the *front* — the chunk already starts
+    at the transient, so we only decide where the decay ends.
+    """
+    if chunk.size == 0:
+        return 0
+    threshold_linear = 10.0 ** (float(threshold_db) / 20.0)
+    abs_audio = np.abs(chunk).astype(np.float64)
+    if abs_audio.size > TRIM_SMOOTH_SAMPLES:
+        pad = TRIM_SMOOTH_SAMPLES // 2
+        padded = np.pad(abs_audio, pad, mode="edge")
+        kernel = np.ones(TRIM_SMOOTH_SAMPLES, dtype=np.float64) / TRIM_SMOOTH_SAMPLES
+        smoothed = np.convolve(padded, kernel, mode="valid")[:abs_audio.size]
+    else:
+        smoothed = abs_audio
+    above = np.where(smoothed >= threshold_linear)[0]
+    if len(above) == 0:
+        return 0
+    return int(above[-1]) + 1
+
+
+def normalize_sample(audio: np.ndarray, peak_target: float = 0.95) -> np.ndarray:
+    """Peak-normalize a single sample so its loudest point hits peak_target."""
+    if audio.size == 0:
+        return audio
+    peak = float(np.max(np.abs(audio)))
+    if peak < 1e-9:
+        return audio
+    return (audio * (peak_target / peak)).astype(np.float32, copy=False)
+
+
 def extract_segments(
     audio: np.ndarray,
     onset_times: np.ndarray,
     segment_length_s: float = SEGMENT_LENGTH_S,
     trim_threshold_db: float = TRIM_THRESHOLD_DB_DEFAULT,
     noise_gate_db: Optional[float] = None,
+    clip_at_next_onset: bool = False,
 ) -> list[Segment]:
-    """Cut, gate, trim. One segment per surviving onset.
+    """Grab one normalized sample per transient, per the data-pipeline spec:
 
-    For each onset t_i:
-      1. Form chunk [t_i, t_i + L].
-      2. If a later onset t_{i+1} falls inside that range, truncate the
-         chunk to end at t_{i+1}. This prevents a long sample length from
-         accidentally swallowing the next hit.
-      3. Drop the chunk if its peak amplitude is below noise_gate_db (the
-         "drop entire sample if too quiet" check).
-      4. Trim leading and trailing silence using trim_threshold_db.
-      5. Drop the chunk if it's shorter than MIN_SEGMENT_S after trim.
-      6. Exact-bytes dedupe as a safety net before clustering-time
-         feature dedupe.
+    For each detected onset t_i (already filtered to those above the noise gate
+    upstream, but re-checked here):
+      1. Start exactly at the transient t_i.
+      2. End at whichever comes first:
+           - the tail falling below the trim threshold,
+           - the sample-length cap (t_i + L),
+           - the next transient t_{i+1}  *only if clip_at_next_onset is on*.
+      3. Drop if the chunk's peak is below the noise gate.
+      4. Drop if shorter than MIN_SEGMENT_S.
+      5. Normalize each surviving sample to a common peak.
+      6. Exact-bytes dedupe as a safety net.
     """
     segment_samples = int(segment_length_s * TARGET_SR)
     segments: list[Segment] = []
     seen_hashes: set[int] = set()
 
-    if noise_gate_db is not None:
-        gate_linear = 10.0 ** (float(noise_gate_db) / 20.0)
-    else:
-        gate_linear = 0.0
+    gate_linear = (10.0 ** (float(noise_gate_db) / 20.0)
+                   if noise_gate_db is not None else 0.0)
 
     for i, t in enumerate(onset_times):
         start = int(t * TARGET_SR)
+        # Hard upper bound = sample-length cap.
         end = start + segment_samples
 
-        # Step 2: truncate at the next onset if one falls inside this chunk.
-        # Using the onset list directly avoids re-detecting transients —
-        # they're the same algorithm and parameters.
-        if i + 1 < len(onset_times):
+        # Optional clipper: also stop at the next transient if it lands sooner.
+        if clip_at_next_onset and i + 1 < len(onset_times):
             next_start = int(onset_times[i + 1] * TARGET_SR)
             if next_start < end:
                 end = next_start
@@ -264,32 +304,33 @@ def extract_segments(
         if chunk.size < MIN_SEGMENT_SAMPLES:
             continue
 
-        # Step 3: peak noise gate. Measured on the (possibly truncated)
-        # chunk before silence trimming; a loud transient anywhere in the
-        # chunk keeps the sample alive.
+        # Noise gate: drop the whole transient if it never gets loud enough.
         peak = float(np.abs(chunk).max())
         if peak < gate_linear:
             continue
 
-        # Step 4: trim leading and trailing silence using the absolute
-        # threshold parameter.
-        trimmed = trim_silence(chunk, threshold_db=trim_threshold_db)
-        if trimmed.size < MIN_SEGMENT_SAMPLES:
+        # End the sample where its tail decays below the trim threshold (never
+        # trims the front — the chunk already begins at the transient).
+        tail = _tail_end_index(chunk, trim_threshold_db)
+        if tail < MIN_SEGMENT_SAMPLES:
             continue
-        trimmed = trimmed.astype(np.float32, copy=False)
+        sample = chunk[:tail]
+
+        # Normalize each sample individually.
+        sample = normalize_sample(sample)
 
         # Exact-bytes guard against perfect duplicates.
-        h = hash(trimmed.tobytes())
+        h = hash(sample.tobytes())
         if h in seen_hashes:
             continue
         seen_hashes.add(h)
 
-        rms = float(np.sqrt(np.mean(trimmed.astype(np.float64) ** 2)))
-        feats = compute_features(trimmed)
-        dom_freq = dominant_frequency(trimmed)
+        rms = float(np.sqrt(np.mean(sample.astype(np.float64) ** 2)))
+        feats = compute_features(sample)
+        dom_freq = dominant_frequency(sample)
         segments.append(
             Segment(
-                audio=trimmed,
+                audio=sample,
                 onset_time=float(t),
                 features=feats,
                 rms=rms,
@@ -517,32 +558,81 @@ def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int) -> 
     return segments
 
 
-def _normalize_cluster_loudness(by_cluster: dict[int, list[Segment]]) -> None:
-    """Per-cluster gain so every key plays at consistent loudness.
+# Fixed drum-machine keyboard layout across one visible octave (17 keys, C..E).
+# (key_index, class, cap label). Classes with several keys (snare, hats, fx)
+# get their samples spread round-robin across those keys for variety.
+DRUM_KEYMAP: list[tuple[int, str, str]] = [
+    (0,  "kick",   "KICK"),
+    (1,  "snare",  "SNR1"),
+    (2,  "snare",  "SNR2"),
+    (3,  "clap",   "CLAP"),
+    (4,  "snare",  "SNR3"),
+    (5,  "lotom",  "LO-T"),
+    (6,  "hats",   "HH1"),
+    (7,  "midtom", "MID-T"),
+    (8,  "hats",   "HH2"),
+    (9,  "hitom",  "HI-T"),
+    (10, "hats",   "HH3"),
+    (11, "fx",     "FX1"),
+    (12, "fx",     "FX2"),
+    (13, "crash",  "CRASH"),
+    (14, "fx",     "FX3"),
+    (15, "ride",   "RIDE"),
+    (16, "fx",     "FX4"),
+]
+# class -> ordered list of key indices it occupies
+CLASS_KEYS: dict[str, list[int]] = {}
+for _k, _c, _lab in DRUM_KEYMAP:
+    CLASS_KEYS.setdefault(_c, []).append(_k)
+# key index -> cap label, for the GUI
+KEY_CAP_LABEL: dict[int, str] = {k: lab for k, _c, lab in DRUM_KEYMAP}
 
-    Scales each cluster so its loudest segment hits TARGET_RMS, capped at
-    PEAK_LIMIT to prevent clipping. Within-cluster relative loudness is
-    preserved (velocity layering still works).
+
+def classify_segments(segments: list[Segment], model) -> list[Segment]:
+    """Tag each segment with its predicted class label (stored on seg.label).
+    The fixed-layout key placement happens in build_instrument_drumkeys.
+
+    `model` is any fitted sklearn classifier exposing predict() over the 57-dim
+    feature vector. Kept model-agnostic on purpose — pipeline.py must not import
+    classifier.py (that would be circular); the GUI passes the loaded model in.
     """
-    TARGET_RMS = 0.20      # roughly -14 dBFS
-    PEAK_LIMIT = 0.95
-    GAIN_CAP = 30.0        # don't blow up basically-silent clusters
+    if not segments:
+        return segments
+    X = np.stack([s.features for s in segments]).astype(np.float64)
+    preds = model.predict(X)
+    for seg, p in zip(segments, preds):
+        seg.label = str(p)
+    return segments
 
-    for segs in by_cluster.values():
-        if not segs:
-            continue
-        max_rms = max(s.rms for s in segs)
-        if max_rms < 1e-6:
-            continue
-        gain = TARGET_RMS / max_rms
-        # Peak-limit check using actual peak (transients can spike well above RMS)
-        cluster_peak = max(float(np.max(np.abs(s.audio))) for s in segs)
-        if cluster_peak > 1e-6 and cluster_peak * gain > PEAK_LIMIT:
-            gain = PEAK_LIMIT / cluster_peak
-        gain = min(gain, GAIN_CAP)
-        for s in segs:
-            s.audio = (s.audio * gain).astype(np.float32, copy=False)
-            s.rms = float(np.sqrt(np.mean(s.audio.astype(np.float64) ** 2)))
+
+def build_instrument_drumkeys(segments: list[Segment], n_keys: int = MAX_KEYS) -> Instrument:
+    """Lay predicted segments onto the fixed drum keyboard. Each class's samples
+    are distributed round-robin across the key(s) assigned to that class (e.g.
+    snares spread over SNR1/SNR2/SNR3), so every key holds a cyclable set."""
+    if not segments:
+        return Instrument()
+    by_class: dict[str, list[Segment]] = {}
+    for s in segments:
+        by_class.setdefault(s.label, []).append(s)
+
+    by_key: dict[int, list[Segment]] = {}
+    for cls, segs in by_class.items():
+        keys = CLASS_KEYS.get(cls)
+        if not keys:
+            continue  # class with no key on this layout — dropped
+        for i, s in enumerate(segs):
+            k = keys[i % len(keys)]
+            s.cluster = k
+            by_key.setdefault(k, []).append(s)
+
+    # No cluster-loudness pass: samples are peak-normalized individually at
+    # extraction, so they already play back at a consistent level.
+    inst = Instrument()
+    for k, segs in by_key.items():
+        if 0 <= k < n_keys:
+            segs.sort(key=lambda s: s.rms)
+            inst.notes[k] = segs
+    return inst
 
 
 def assign_keys_to_clusters(
@@ -585,15 +675,10 @@ def build_instrument(
     n_keys: int = MAX_KEYS,
     sort_by_freq: bool = True,
 ) -> Instrument:
-    """One-time build: normalize cluster loudness (mutates audio), then assign keys."""
+    """One-time build → assign keys. Samples are already peak-normalized
+    individually at extraction, so no cluster-loudness pass is needed."""
     if not segments:
         return Instrument()
-
-    by_cluster: dict[int, list[Segment]] = {}
-    for s in segments:
-        by_cluster.setdefault(s.cluster, []).append(s)
-    _normalize_cluster_loudness(by_cluster)
-
     return assign_keys_to_clusters(segments, sort_by_freq=sort_by_freq, n_keys=n_keys)
 
 
@@ -608,6 +693,8 @@ def run_pipeline(
     trim_threshold_db: float = TRIM_THRESHOLD_DB_DEFAULT,
     noise_gate_db: Optional[float] = None,
     n_keys: int = MAX_KEYS,
+    classifier_model=None,
+    clip_at_next_onset: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Instrument:
     def report(msg: str, frac: float) -> None:
@@ -629,6 +716,7 @@ def run_pipeline(
         segment_length_s=segment_length_s,
         trim_threshold_db=trim_threshold_db,
         noise_gate_db=noise_gate_db,
+        clip_at_next_onset=clip_at_next_onset,
     )
     if not segments:
         report("No usable segments — all were silent, too short, or below the gate.", 1.0)
@@ -643,7 +731,10 @@ def run_pipeline(
     n_kept = len(segments)
     n_dropped = len(onsets) - n_kept
 
-    if mode == "hdbscan":
+    if mode == "classify":
+        report(f"Classifying {n_kept} segments…", 0.70)
+        classify_segments(segments, classifier_model)
+    elif mode == "hdbscan":
         report(f"HDBSCAN on {n_kept} segments (min size {min_cluster_size})…", 0.70)
         cluster_segments_hdbscan(segments, min_cluster_size)
     elif mode == "auto":
@@ -656,7 +747,10 @@ def run_pipeline(
 
     n_clusters_found = len({s.cluster for s in segments})
     report("Building instrument…", 0.90)
-    instrument = build_instrument(segments, n_keys=n_keys)
+    if mode == "classify":
+        instrument = build_instrument_drumkeys(segments, n_keys=n_keys)
+    else:
+        instrument = build_instrument(segments, n_keys=n_keys)
     n_loaded = len(instrument.loaded_notes())
     n_octaves = instrument.max_octave() + 1 if n_loaded else 0
 
@@ -668,7 +762,8 @@ def run_pipeline(
         if n_dedup > 0:
             bits.append(f"{n_dedup} dup")
         parts.append("(" + ", ".join(bits) + " dropped)")
-    parts.append(f"→ {n_clusters_found} clusters → {n_loaded} keys")
+    grouping = "classes" if mode == "classify" else "clusters"
+    parts.append(f"→ {n_clusters_found} {grouping} → {n_loaded} keys")
     parts.append(f"across {n_octaves} octave{'s' if n_octaves != 1 else ''}.")
     report(" ".join(parts), 1.0)
     return instrument

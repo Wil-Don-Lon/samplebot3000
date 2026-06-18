@@ -11,11 +11,11 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath, QLinearGradient
 from PySide6.QtWidgets import QWidget
 
 
-# Theme accent — keep in sync with gui.py
-ACCENT = QColor("#4af3f3")
-ACCENT_DIM = QColor(74, 243, 243, 40)
-GRID = QColor("#1c1c24")
-BG = QColor("#0d0d12")
+# Theme accent — keep in sync with gui.py (spaceage Moog amber)
+ACCENT = QColor("#ff8a1e")
+ACCENT_DIM = QColor(255, 138, 30, 40)
+GRID = QColor("#2c2114")
+BG = QColor("#0b0907")
 
 
 class ADSREnvelopeWidget(QWidget):

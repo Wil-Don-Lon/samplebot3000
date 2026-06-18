@@ -23,10 +23,10 @@ from pipeline import Instrument, Segment, NOTE_NAMES_12, TARGET_SR
 from audio_engine import AudioEngine
 
 
-WAVEFORM_COLOR = QColor("#4af3f3")
-WAVEFORM_COLOR_REP = QColor("#ff8c3a")
-WAVEFORM_BG = QColor("#0d0d12")
-WAVEFORM_CENTERLINE = QColor("#1c1c24")
+WAVEFORM_COLOR = QColor("#ff8a1e")
+WAVEFORM_COLOR_REP = QColor("#7fe6dc")
+WAVEFORM_BG = QColor("#0b0907")
+WAVEFORM_CENTERLINE = QColor("#2c2114")
 
 
 class WaveformWidget(QWidget):
@@ -111,6 +111,8 @@ class ClusterViewerDialog(QDialog):
         instrument: Instrument,
         engine: AudioEngine,
         get_gain: Callable[[], float],
+        labels: Optional[dict[int, str]] = None,
+        confidences: Optional[dict[int, float]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -119,6 +121,8 @@ class ClusterViewerDialog(QDialog):
         self._instrument = instrument
         self._engine = engine
         self._get_gain = get_gain
+        self._labels = labels or {}
+        self._confidences = confidences or {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -184,10 +188,18 @@ class ClusterViewerDialog(QDialog):
         v.setSpacing(4)
 
         n = len(segs)
-        title = QLabel(
-            f"<span style='color:#4af3f3'>KEY {_key_label(key_idx).upper()}</span>"
+        title_html = (
+            f"<span style='color:#ffb15a'>KEY {_key_label(key_idx).upper()}</span>"
             f"<span style='color:#666'> · {n} segment{'s' if n != 1 else ''}</span>"
         )
+        label = self._labels.get(key_idx)
+        if label:
+            conf = self._confidences.get(key_idx)
+            conf_txt = f" {conf*100:.0f}%" if conf is not None else ""
+            title_html += (
+                f"<span style='color:#7fe6dc'> · {label.upper()}{conf_txt}</span>"
+            )
+        title = QLabel(title_html)
         title.setObjectName("clusterTitle")
         v.addWidget(title)
 
@@ -217,7 +229,7 @@ class ClusterViewerDialog(QDialog):
         duration_s = seg.audio.size / float(TARGET_SR) if seg.audio is not None else 0.0
         text = f"t={seg.onset_time:6.2f}s · rms={seg.rms:.3f} · dur={duration_s:.2f}s"
         if is_rep:
-            text = f"<span style='color:#ff8c3a'><b>{text} · rep</b></span>"
+            text = f"<span style='color:#7fe6dc'><b>{text} · rep</b></span>"
         lbl = QLabel(text)
         lbl.setObjectName("segmentRow")
         h.addWidget(lbl, 1)

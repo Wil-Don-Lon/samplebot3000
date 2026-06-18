@@ -40,6 +40,16 @@ class _Voice:
     env_phase: int = _ATTACK
     env_t: int = 0                  # samples elapsed in current phase
     env_release_start: float = 1.0  # envelope level when release began
+    # Per-voice ADSR (seconds for A/D/R, level [0,1] for S) — captured at play
+    # time so each sample carries its own envelope, independent of other voices.
+    a: float = 0.001
+    d: float = 0.001
+    s: float = 1.0
+    r: float = 0.05
+    # Per-voice lowpass: cutoff + its own cascade state, so each sample is
+    # filtered independently rather than sharing one master filter.
+    cutoff_hz: float = 20000.0
+    lpf_state: Optional[list] = None
 
 
 class AudioEngine:
@@ -79,14 +89,20 @@ class AudioEngine:
     def start(self) -> None:
         if self._stream is not None:
             return
-        self._stream = sd.OutputStream(
-            samplerate=self.sample_rate,
-            blocksize=self.block_size,
-            channels=1,
-            dtype="float32",
-            callback=self._callback,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                blocksize=self.block_size,
+                channels=1,
+                dtype="float32",
+                callback=self._callback,
+            )
+            self._stream.start()
+        except Exception as exc:  # noqa: BLE001 — PortAudio/CoreAudio can fail
+            # No usable audio device (e.g. wrong Python env, headless, locked
+            # CoreAudio). Run silent so the GUI still opens and analysis works.
+            self._stream = None
+            print(f"[audio] output unavailable — running without sound: {exc}")
 
     def stop(self) -> None:
         if self._stream is None:
@@ -128,9 +144,19 @@ class AudioEngine:
 
     # ---------- triggers ----------
 
-    def play(self, audio: np.ndarray, gain: float = 1.0, note_id: int = -1) -> None:
-        """Non-blocking, thread-safe: append a fresh voice with envelope in ATTACK."""
-        if audio is None:
+    def play(
+        self,
+        audio: np.ndarray,
+        gain: float = 1.0,
+        note_id: int = -1,
+        adsr: Optional[tuple[float, float, float, float]] = None,
+        cutoff_hz: Optional[float] = None,
+        loop: Optional[bool] = None,
+    ) -> None:
+        """Non-blocking, thread-safe: append a fresh voice with envelope in
+        ATTACK. ADSR / cutoff / loop default to the engine globals (set_*) when
+        not given, so each sample can carry its own playback settings."""
+        if audio is None or self._stream is None:
             return
         a = np.asarray(audio)
         if a.size == 0:
@@ -142,9 +168,17 @@ class AudioEngine:
         elif a.ndim != 1:
             a = a.flatten().astype(np.float32, copy=False)
         with self._lock:
+            va, vd, vs, vr = adsr if adsr is not None else (self._a, self._d, self._s, self._r)
+            vc = self._lpf_cutoff_hz if cutoff_hz is None else float(cutoff_hz)
+            vc = max(20.0, min(self.sample_rate / 2.0, vc))
             v = _Voice(
                 audio=a, pos=0, gain=float(gain), note_id=int(note_id),
-                loop=self._loop_enabled,
+                loop=self._loop_enabled if loop is None else bool(loop),
+                a=max(0.0, float(va)), d=max(0.0, float(vd)),
+                s=max(0.0, min(1.0, float(vs))), r=max(0.0, float(vr)),
+                cutoff_hz=vc,
+                lpf_state=[np.zeros(1, dtype=np.float64)
+                           for _ in range(self._lpf_n_stages)],
             )
             self._voices.append(v)
 
@@ -169,15 +203,15 @@ class AudioEngine:
         """Caller holds lock."""
         sr = self.sample_rate
         if v.env_phase == _ATTACK:
-            a_s = max(1, int(self._a * sr))
+            a_s = max(1, int(v.a * sr))
             return min(1.0, v.env_t / a_s)
         if v.env_phase == _DECAY:
-            d_s = max(1, int(self._d * sr))
-            return 1.0 + (self._s - 1.0) * min(1.0, v.env_t / d_s)
+            d_s = max(1, int(v.d * sr))
+            return 1.0 + (v.s - 1.0) * min(1.0, v.env_t / d_s)
         if v.env_phase == _SUSTAIN:
-            return self._s
+            return v.s
         if v.env_phase == _RELEASE:
-            r_s = max(1, int(self._r * sr))
+            r_s = max(1, int(v.r * sr))
             return v.env_release_start * max(0.0, 1.0 - v.env_t / r_s)
         return 0.0
 
@@ -186,14 +220,14 @@ class AudioEngine:
         out = np.zeros(n, dtype=np.float32)
         idx = 0
         sr = self.sample_rate
-        a_s = max(1, int(self._a * sr))
-        d_s = max(1, int(self._d * sr))
-        r_s = max(1, int(self._r * sr))
-        s_level = self._s
+        a_s = max(1, int(v.a * sr))
+        d_s = max(1, int(v.d * sr))
+        r_s = max(1, int(v.r * sr))
+        s_level = v.s
 
         while idx < n and v.env_phase != _DONE:
             if v.env_phase == _ATTACK:
-                if self._a <= 0:
+                if v.a <= 0:
                     v.env_phase = _DECAY
                     v.env_t = 0
                     continue
@@ -207,7 +241,7 @@ class AudioEngine:
                     v.env_phase = _DECAY
                     v.env_t = 0
             elif v.env_phase == _DECAY:
-                if self._d <= 0:
+                if v.d <= 0:
                     v.env_phase = _SUSTAIN
                     v.env_t = 0
                     continue
@@ -226,7 +260,7 @@ class AudioEngine:
                 idx += take
                 v.env_t += take
             elif v.env_phase == _RELEASE:
-                if self._r <= 0:
+                if v.r <= 0:
                     v.env_phase = _DONE
                     break
                 take = min(n - idx, max(0, r_s - v.env_t))
@@ -246,16 +280,18 @@ class AudioEngine:
 
     def _callback(self, outdata, frames, time_info, status) -> None:
         mix = np.zeros(frames, dtype=np.float32)
+        nyq = self.sample_rate / 2.0
         with self._lock:
             still_active: list[_Voice] = []
             for v in self._voices:
                 if v.env_phase == _DONE:
                     continue
 
-                # Produce `frames` samples for this voice. If the audio buffer
-                # runs out mid-block, either wrap (loop=True) or terminate the
-                # voice (loop=False). The envelope timer keeps advancing in
-                # wall-clock samples regardless of any audio wraps.
+                # Produce `frames` samples for this voice into its own buffer.
+                # If the audio buffer runs out mid-block, either wrap
+                # (loop=True) or terminate the voice (loop=False). The envelope
+                # timer keeps advancing in wall-clock samples regardless.
+                voice_out = np.zeros(frames, dtype=np.float32)
                 produced = 0
                 while produced < frames and v.env_phase != _DONE:
                     remaining_audio = len(v.audio) - v.pos
@@ -269,29 +305,32 @@ class AudioEngine:
 
                     n = min(frames - produced, remaining_audio)
                     env = self._voice_envelope_block(v, n)
-                    mix[produced:produced + n] += v.audio[v.pos:v.pos + n] * v.gain * env
+                    voice_out[produced:produced + n] = (
+                        v.audio[v.pos:v.pos + n] * v.gain * env
+                    )
                     v.pos += n
                     produced += n
 
+                # Per-voice lowpass — cascaded one-pole IIR with the voice's own
+                # cutoff and persistent state, so each sample is filtered
+                # independently.
+                if v.cutoff_hz < nyq * 0.98 and v.lpf_state is not None:
+                    fc_pole = min(v.cutoff_hz * self._lpf_compensation, nyq * 0.99)
+                    alpha = 1.0 - float(np.exp(-2.0 * np.pi * fc_pole / self.sample_rate))
+                    alpha = max(0.0, min(1.0, alpha))
+                    b = np.array([alpha], dtype=np.float64)
+                    a = np.array([1.0, -(1.0 - alpha)], dtype=np.float64)
+                    out = voice_out.astype(np.float64, copy=False)
+                    for stage in range(self._lpf_n_stages):
+                        out, v.lpf_state[stage] = lfilter(
+                            b, a, out, zi=v.lpf_state[stage]
+                        )
+                    voice_out = out.astype(np.float32, copy=False)
+
+                mix += voice_out
                 if v.env_phase != _DONE:
                     still_active.append(v)
             self._voices = still_active
-
-            # Master lowpass — cascaded one-pole IIR. Coefficients computed
-            # from current cutoff each block; state preserved across blocks.
-            nyq = self.sample_rate / 2.0
-            if self._lpf_cutoff_hz < nyq * 0.98:
-                fc_pole = min(self._lpf_cutoff_hz * self._lpf_compensation, nyq * 0.99)
-                alpha = 1.0 - float(np.exp(-2.0 * np.pi * fc_pole / self.sample_rate))
-                alpha = max(0.0, min(1.0, alpha))
-                b = np.array([alpha], dtype=np.float64)
-                a = np.array([1.0, -(1.0 - alpha)], dtype=np.float64)
-                out = mix.astype(np.float64, copy=False)
-                for stage in range(self._lpf_n_stages):
-                    out, self._lpf_state[stage] = lfilter(
-                        b, a, out, zi=self._lpf_state[stage]
-                    )
-                mix = out.astype(np.float32, copy=False)
 
         np.clip(mix, -1.0, 1.0, out=mix)
         outdata[:, 0] = mix

@@ -45,17 +45,18 @@ BLACK_WIDTH_FRACTION = 0.55
 BLACK_HEIGHT_FRACTION = 0.62
 
 
-# Theme — keep in sync with gui.py / adsr_widget.py
-COLOR_BG          = QColor("#0d0d12")
-COLOR_WHITE_DEF   = QColor("#e8eef0")
-COLOR_WHITE_LOAD  = QColor("#bcd9d9")    # subtle cyan tint
-COLOR_WHITE_PRESS = QColor("#4af3f3")
-COLOR_BLACK_DEF   = QColor("#16161e")
-COLOR_BLACK_LOAD  = QColor("#1f2c30")    # cooler dark
-COLOR_BLACK_PRESS = QColor("#4af3f3")
-COLOR_BORDER      = QColor("#2a2a35")
-COLOR_LABEL_LIGHT = QColor("#e8e8ee")
-COLOR_LABEL_DARK  = QColor("#3a3a45")
+# Theme — spaceage Moog, keep in sync with gui.py / adsr_widget.py
+COLOR_BG          = QColor("#0b0907")
+COLOR_WHITE_DEF   = QColor("#e8ddc6")    # warm ivory
+COLOR_WHITE_LOAD  = QColor("#e0b878")    # amber-tinted (loaded)
+COLOR_WHITE_PRESS = QColor("#ff8a1e")    # amber (pressed)
+COLOR_BLACK_DEF   = QColor("#171209")
+COLOR_BLACK_LOAD  = QColor("#3a2a12")    # warm dark (loaded)
+COLOR_BLACK_PRESS = QColor("#ff8a1e")    # amber (pressed)
+COLOR_BORDER      = QColor("#4a3820")
+COLOR_LABEL_LIGHT = QColor("#f0e3cd")
+COLOR_LABEL_DARK  = QColor("#4a3c28")
+COLOR_SELECT      = QColor("#ff8a1e")    # selected-key outline
 
 
 class PianoKeyboardWidget(QWidget):
@@ -64,9 +65,11 @@ class PianoKeyboardWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(140)
+        self.setMinimumHeight(110)
         self._pressed: set[int] = set()
         self._loaded: set[int] = set()
+        self._labels: dict[int, str] = {}   # chromatic index -> predicted label
+        self._selected: Optional[int] = None  # currently selected key (sequencer)
         self._mouse_note: Optional[int] = None
 
     def press_note(self, note_index: int) -> None:
@@ -85,6 +88,16 @@ class PianoKeyboardWidget(QWidget):
 
     def set_loaded(self, note_indices: set[int]) -> None:
         self._loaded = set(note_indices)
+        self.update()
+
+    def set_key_labels(self, labels: dict[int, str]) -> None:
+        """Predicted instrument label per visible chromatic key index."""
+        self._labels = dict(labels)
+        self.update()
+
+    def set_selected(self, note_index: Optional[int]) -> None:
+        """Mark a key as the selected/active one (drawn with an amber outline)."""
+        self._selected = note_index
         self.update()
 
     # ---------- geometry ----------
@@ -131,6 +144,12 @@ class PianoKeyboardWidget(QWidget):
             p.setPen(QPen(COLOR_BORDER, 1.0))
             p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 2, 2)
             self._draw_label(p, r, NOTES[chromatic][1], COLOR_LABEL_DARK)
+            if chromatic in self._labels:
+                self._draw_top_label(p, r, self._labels[chromatic], COLOR_LABEL_DARK)
+            if chromatic == self._selected:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(COLOR_SELECT, 2.5))
+                p.drawRoundedRect(r.adjusted(2, 2, -2, -2), 2, 2)
 
         for chromatic in BLACK_KEY_RIGHT_OF_WHITE:
             r = self._black_key_rect(chromatic)
@@ -147,6 +166,15 @@ class PianoKeyboardWidget(QWidget):
             p.drawRoundedRect(r, 2, 2)
             label_color = COLOR_LABEL_DARK if pressed else COLOR_LABEL_LIGHT
             self._draw_label(p, r, NOTES[chromatic][1], label_color)
+            if chromatic in self._labels:
+                self._draw_top_label(
+                    p, r, self._labels[chromatic],
+                    COLOR_LABEL_DARK if pressed else COLOR_WHITE_PRESS,
+                )
+            if chromatic == self._selected:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(COLOR_SELECT, 2.0))
+                p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 2, 2)
 
     def _draw_label(self, p: QPainter, r: QRectF, text: str, color: QColor) -> None:
         font = QFont(p.font())
@@ -156,6 +184,15 @@ class PianoKeyboardWidget(QWidget):
         p.setPen(color)
         label_rect = QRectF(r.left(), r.bottom() - 22, r.width(), 18)
         p.drawText(label_rect, Qt.AlignHCenter | Qt.AlignVCenter, text)
+
+    def _draw_top_label(self, p: QPainter, r: QRectF, text: str, color: QColor) -> None:
+        font = QFont(p.font())
+        font.setPointSize(7)
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(color)
+        label_rect = QRectF(r.left(), r.top() + 4, r.width(), 12)
+        p.drawText(label_rect, Qt.AlignHCenter | Qt.AlignTop, text)
 
     # ---------- mouse ----------
 

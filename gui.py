@@ -9,24 +9,70 @@ Layout: two columns of controls above a piano keyboard.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFileDialog, QSpinBox, QSlider, QProgressBar,
-    QFrame, QSizePolicy, QComboBox, QCheckBox,
+    QFrame, QSizePolicy, QComboBox, QCheckBox, QButtonGroup, QScrollArea,
+    QApplication,
 )
 
 from pipeline import (
     run_pipeline, assign_keys_to_clusters, Instrument, NOTE_NAMES, MAX_KEYS,
+    KEY_CAP_LABEL,
 )
 from audio_engine import AudioEngine
 from piano_widget import PianoKeyboardWidget
 from cluster_viewer import ClusterViewerDialog
 from adsr_widget import ADSREnvelopeWidget
+from classifier import available_models, load_bundle, MODEL_LABELS
+from moog_widgets import Knob, ToggleSwitch, LED, StepGrid
+
+try:
+    from scipy.signal import butter, lfilter
+    _HAVE_SCIPY = True
+except Exception:  # noqa: BLE001
+    _HAVE_SCIPY = False
+
+N_STEPS = 16  # sequencer length
+
+
+from dataclasses import dataclass
+
+
+@dataclass
+class PlaybackSettings:
+    """Per-sample playback parameters, stored in widget (slider) domain so they
+    load back into the controls exactly. Converted to engine units at play time.
+    Defaults match the control defaults."""
+    velocity: int = 100   # 1..127
+    loop: bool = False
+    a: int = 0            # 0..100  -> *0.01 s   attack
+    d: int = 0            # 0..100  -> *0.01 s   decay
+    s: int = 100          # 0..100  -> /100      sustain level
+    r: int = 5            # 0..100  -> *0.02 s   release
+    lpf: int = 100        # 0..100  -> _lpf_from_slider -> Hz
+
+
+def velocity_lowpass(audio: np.ndarray, velocity: int, sr: int = 44100) -> np.ndarray:
+    """Slight velocity-dependent lowpass: softer hits are a touch darker.
+    Full bandwidth at max velocity; gentle 2nd-order rolloff toward ~6 kHz at
+    the lowest velocity. No-op without scipy."""
+    if velocity >= 127 or not _HAVE_SCIPY or audio.size < 16:
+        return audio
+    frac = max(0.0, min(1.0, velocity / 127.0))
+    cutoff = 6000.0 * (sr * 0.45 / 6000.0) ** frac   # ~6 kHz .. ~Nyquist
+    if cutoff >= sr * 0.45:
+        return audio
+    b, a = butter(2, cutoff / (sr * 0.5), btype="low")
+    return lfilter(b, a, audio).astype(np.float32, copy=False)
 
 
 KEY_TO_NOTE = {
@@ -46,55 +92,69 @@ OCTAVE_STEP = 12
 # ---------- futuristic minimalist stylesheet ----------
 
 STYLESHEET = """
+/* ── SPACEAGE MOOG · warm amber analog-synth panel ───────────────── */
 QMainWindow, QDialog {
-    background-color: #0d0d12;
+    background-color: #0b0907;
+}
+/* Wood cabinet around the panel */
+QWidget#wood {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #2e1a0c, stop:0.06 #5a3818, stop:0.12 #3a2410,
+        stop:0.5 #4a2e14, stop:0.88 #3a2410, stop:0.94 #5a3818, stop:1 #2e1a0c);
+}
+/* Brushed-metal control panel */
+QFrame#panel {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #1c1812, stop:0.5 #15110b, stop:1 #100d08);
+    border: 2px solid #060504;
+    border-radius: 6px;
 }
 QWidget {
-    color: #c8c8d0;
+    color: #d8cdbb;
     font-family: -apple-system, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
     font-size: 12px;
 }
 QLabel { background: transparent; }
 
 QLabel#title {
-    color: #e8e8ee;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 4px;
+    color: #ffb15a;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 6px;
 }
 QLabel#subtitle {
-    color: #555560;
+    color: #8a6a3a;
     font-size: 10px;
-    letter-spacing: 2px;
+    letter-spacing: 3px;
 }
 QLabel#sectionHeader {
-    color: #4af3f3;
+    color: #ff8a1e;
     font-size: 9px;
-    font-weight: 600;
-    letter-spacing: 3px;
-    padding-top: 4px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    padding-top: 6px;
 }
 QLabel#controlLabel {
-    color: #777787;
+    color: #9c8463;
     font-size: 10px;
     letter-spacing: 1.5px;
 }
 QLabel#valueLabel {
-    color: #4af3f3;
+    color: #7fe6dc;                 /* pale cyan LED readout */
     font-family: "SF Mono", "Menlo", monospace;
     font-size: 11px;
 }
 QLabel#statusLabel {
-    color: #888896;
+    color: #a08c6a;
     font-size: 11px;
 }
 QLabel#hintLabel {
-    color: #555565;
+    color: #6a5638;
     font-size: 10px;
     letter-spacing: 2px;
 }
 QLabel#octaveValue {
-    color: #4af3f3;
+    color: #7fe6dc;
     font-family: "SF Mono", "Menlo", monospace;
     font-size: 13px;
     font-weight: 600;
@@ -102,12 +162,12 @@ QLabel#octaveValue {
 
 /* Cluster viewer labels */
 QLabel#dialogHeader {
-    color: #e8e8ee;
+    color: #ffb15a;
     font-size: 11px;
     letter-spacing: 2px;
 }
 QLabel#dialogSubtle, QLabel#segmentRow {
-    color: #888896;
+    color: #a08c6a;
     font-size: 11px;
 }
 QLabel#segmentRow {
@@ -120,25 +180,37 @@ QLabel#clusterTitle {
 }
 
 QPushButton {
-    background-color: transparent;
-    color: #4af3f3;
-    border: 1px solid #2a2a35;
+    background-color: #17120c;
+    color: #ffae57;
+    border: 1px solid #4a3820;
     padding: 7px 16px;
-    border-radius: 1px;
+    border-radius: 3px;
     font-size: 10px;
     letter-spacing: 2px;
-    font-weight: 500;
+    font-weight: 600;
 }
-QPushButton:hover { border-color: #4af3f3; background-color: rgba(74, 243, 243, 12); }
-QPushButton:pressed { background-color: rgba(74, 243, 243, 25); }
-QPushButton:disabled { color: #2a2a35; border-color: #1a1a22; }
+QPushButton:hover { border-color: #ff8a1e; color: #ffd29a; background-color: #221a10; }
+QPushButton:pressed { background-color: #ff8a1e; color: #1a1206; }
+QPushButton:disabled { color: #4a3c28; border-color: #2a2014; background-color: #120e09; }
+
+/* Method toggle — segmented two-button switch */
+QPushButton#toggleLeft  { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+QPushButton#toggleRight { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: none; }
+QPushButton#toggleLeft:checked, QPushButton#toggleRight:checked {
+    background-color: #ff8a1e;
+    color: #160f06;
+    border-color: #ff8a1e;
+}
 
 QPushButton#playBtn {
-    color: #4af3f3;
+    color: #ff8a1e;
+    background: transparent;
+    border: none;
     padding: 2px;
-    font-size: 11px;
+    font-size: 13px;
     letter-spacing: 0;
 }
+QPushButton#playBtn:hover { color: #ffd29a; }
 QPushButton#octaveBtn {
     padding: 4px 10px;
     font-size: 11px;
@@ -146,22 +218,22 @@ QPushButton#octaveBtn {
 }
 
 QFrame#clusterGroup {
-    background-color: #14141c;
-    border: 1px solid #1f1f28;
-    border-radius: 2px;
+    background-color: #15110b;
+    border: 1px solid #2c2114;
+    border-radius: 4px;
 }
 
 QSpinBox, QComboBox {
-    background-color: #14141c;
-    color: #e8e8ee;
-    border: 1px solid #2a2a35;
+    background-color: #17120c;
+    color: #f0e3cd;
+    border: 1px solid #4a3820;
     padding: 5px 10px;
-    border-radius: 1px;
-    selection-background-color: #4af3f3;
-    selection-color: #0d0d12;
+    border-radius: 3px;
+    selection-background-color: #ff8a1e;
+    selection-color: #160f06;
     min-width: 80px;
 }
-QSpinBox:hover, QComboBox:hover { border-color: #3a3a45; }
+QSpinBox:hover, QComboBox:hover { border-color: #ff8a1e; }
 QSpinBox::up-button, QSpinBox::down-button {
     background: transparent;
     border: none;
@@ -172,70 +244,72 @@ QComboBox::down-arrow {
     image: none;
     border-left: 4px solid transparent;
     border-right: 4px solid transparent;
-    border-top: 4px solid #4af3f3;
+    border-top: 5px solid #ff8a1e;
     margin-right: 7px;
 }
 QComboBox QAbstractItemView {
-    background-color: #14141c;
-    color: #e8e8ee;
-    border: 1px solid #2a2a35;
-    selection-background-color: #4af3f3;
-    selection-color: #0d0d12;
+    background-color: #17120c;
+    color: #f0e3cd;
+    border: 1px solid #4a3820;
+    selection-background-color: #ff8a1e;
+    selection-color: #160f06;
     outline: none;
 }
 
 QSlider::groove:horizontal {
     border: none;
-    background: #1c1c24;
-    height: 2px;
-    border-radius: 1px;
+    background: #2a2014;
+    height: 3px;
+    border-radius: 2px;
 }
 QSlider::handle:horizontal {
-    background: #4af3f3;
-    border: none;
-    width: 10px;
-    height: 10px;
-    margin: -5px 0;
-    border-radius: 5px;
+    background: #ffae57;
+    border: 2px solid #1a1206;
+    width: 14px;
+    height: 14px;
+    margin: -7px 0;
+    border-radius: 8px;
 }
-QSlider::handle:horizontal:hover { background: #7ff; }
-QSlider::sub-page:horizontal { background: #4af3f3; height: 2px; border-radius: 1px; }
+QSlider::handle:horizontal:hover { background: #ffd29a; }
+QSlider::sub-page:horizontal { background: #ff8a1e; height: 3px; border-radius: 2px; }
 
 QProgressBar {
-    background-color: #1c1c24;
+    background-color: #2a2014;
     border: none;
     border-radius: 0;
-    height: 2px;
+    height: 3px;
     text-align: center;
 }
-QProgressBar::chunk { background-color: #4af3f3; }
+QProgressBar::chunk { background-color: #ff8a1e; }
 
 QScrollArea { background-color: transparent; border: none; }
-QScrollBar:vertical { background: #0d0d12; width: 6px; margin: 0; }
+QScrollBar:vertical { background: #0b0907; width: 6px; margin: 0; }
 QScrollBar::handle:vertical {
-    background: #2a2a35; border-radius: 3px; min-height: 24px;
+    background: #4a3820; border-radius: 3px; min-height: 24px;
 }
-QScrollBar::handle:vertical:hover { background: #4af3f3; }
+QScrollBar::handle:vertical:hover { background: #ff8a1e; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     background: none; height: 0;
 }
 
-QFrame[frameShape="4"] { color: #1c1c24; background: #1c1c24; max-height: 1px; }
+QFrame[frameShape="4"] { color: #2c2114; background: #2c2114; max-height: 1px; }
+QFrame[frameShape="5"] { color: #2c2114; background: #2c2114; max-width: 1px; }
 
-QCheckBox { color: #c8c8d0; spacing: 8px; }
+QCheckBox { color: #d8cdbb; spacing: 8px; }
 QCheckBox::indicator {
     width: 14px;
     height: 14px;
-    border: 1px solid #2a2a35;
-    background: transparent;
-    border-radius: 1px;
+    border: 1px solid #4a3820;
+    background: #17120c;
+    border-radius: 2px;
 }
-QCheckBox::indicator:hover { border-color: #4af3f3; }
+QCheckBox::indicator:hover { border-color: #ff8a1e; }
 QCheckBox::indicator:checked {
-    background: #4af3f3;
-    border-color: #4af3f3;
+    background: #ff8a1e;
+    border-color: #ff8a1e;
     image: none;
 }
+QCheckBox:disabled { color: #5a4c38; }
 """
 
 
@@ -255,6 +329,8 @@ class PipelineWorker(QObject):
         segment_length_s: float,
         trim_threshold_db: float,
         noise_gate_db,
+        classifier_model=None,
+        clip_at_next_onset: bool = False,
     ) -> None:
         super().__init__()
         self._audio_path = audio_path
@@ -266,6 +342,8 @@ class PipelineWorker(QObject):
         self._segment_length_s = segment_length_s
         self._trim_threshold_db = trim_threshold_db
         self._noise_gate_db = noise_gate_db
+        self._classifier_model = classifier_model
+        self._clip_at_next_onset = clip_at_next_onset
 
     @Slot()
     def run(self) -> None:
@@ -281,6 +359,8 @@ class PipelineWorker(QObject):
                 trim_threshold_db=self._trim_threshold_db,
                 noise_gate_db=self._noise_gate_db,
                 n_keys=MAX_KEYS,
+                classifier_model=self._classifier_model,
+                clip_at_next_onset=self._clip_at_next_onset,
                 progress_callback=lambda msg, frac: self.progress.emit(msg, frac),
             )
             self.finished.emit(inst)
@@ -292,8 +372,14 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("samplebot-3000")
-        self.resize(940, 620)
         self.setFocusPolicy(Qt.StrongFocus)
+        # Fit the initial window to the available screen so it never opens
+        # taller/wider than the display (the panel scrolls if it needs more).
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        w = min(940, avail.width() - 40) if avail else 940
+        h = min(620, avail.height() - 80) if avail else 620
+        self.resize(w, h)
 
         self._audio_path: Optional[str] = None
         self._instrument: Instrument = Instrument()
@@ -303,6 +389,22 @@ class MainWindow(QMainWindow):
         self._octave: int = 0
         self._thread: Optional[QThread] = None
         self._worker: Optional[PipelineWorker] = None
+
+        # Method + supervised classification state.
+        self._method: str = "cluster"               # "cluster" | "classify"
+        self._result_is_classify: bool = False       # what the last run produced
+        self._model_bundle = None
+        self._model_cache: dict[str, object] = {}     # name -> loaded bundle
+        self._cluster_labels: dict[int, str] = {}    # cluster idx -> label
+        self._cluster_conf: dict[int, float] = {}     # cluster idx -> confidence
+
+        # Per-key chosen sample (arrow-tab), selection, and step patterns.
+        self._sample_choice: dict[int, int] = {}      # key -> chosen sample idx
+        self._selected_key: Optional[int] = None
+        self._patterns: dict[int, list[bool]] = {}    # key -> 16-step pattern
+        # True while pushing a sample's settings into the controls, so the
+        # control-changed handlers don't write them straight back.
+        self._loading_settings: bool = False
 
         self._engine = AudioEngine()
         self._engine.start()
@@ -316,9 +418,23 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def _build_ui(self) -> None:
+        # Scroll area as the central widget so the panel can never be taller
+        # than the window — it scrolls instead of clipping off-screen.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setCentralWidget(scroll)
+
         central = QWidget()
-        self.setCentralWidget(central)
-        outer = QVBoxLayout(central)
+        central.setObjectName("wood")
+        scroll.setWidget(central)
+        shell = QVBoxLayout(central)
+        shell.setContentsMargins(16, 16, 16, 16)   # wood border peeks through
+        panel = QFrame()
+        panel.setObjectName("panel")
+        shell.addWidget(panel)
+        outer = QVBoxLayout(panel)
         outer.setContentsMargins(20, 16, 20, 16)
         outer.setSpacing(14)
 
@@ -326,7 +442,7 @@ class MainWindow(QMainWindow):
         header_row = QHBoxLayout()
         title = QLabel("SAMPLEBOT-3000")
         title.setObjectName("title")
-        subtitle = QLabel("UNSUPERVISED SAMPLER")
+        subtitle = QLabel("ANALOG · DIGITAL DRUM ENGINE")
         subtitle.setObjectName("subtitle")
         header_row.addWidget(title)
         header_row.addSpacing(12)
@@ -350,6 +466,37 @@ class MainWindow(QMainWindow):
         outer.addLayout(cols, 1)
 
         outer.addWidget(self._hline())
+
+        # Active-key indicator + sample selector. Pick a key, then tab through
+        # its samples with the arrows; the key plays the chosen sample.
+        active_row = QHBoxLayout()
+        active_row.setSpacing(8)
+        self.active_led = LED()
+        active_row.addWidget(self.active_led)
+        active_cap = QLabel("ACTIVE")
+        active_cap.setObjectName("controlLabel")
+        active_row.addWidget(active_cap)
+        self.active_lbl = QLabel("—")
+        self.active_lbl.setObjectName("octaveValue")
+        active_row.addWidget(self.active_lbl)
+        active_row.addSpacing(16)
+        self.sample_prev_btn = QPushButton("◀")
+        self.sample_prev_btn.setObjectName("octaveBtn")
+        self.sample_prev_btn.setEnabled(False)
+        self.sample_prev_btn.clicked.connect(lambda: self._step_sample(-1))
+        active_row.addWidget(self.sample_prev_btn)
+        self.sample_lbl = QLabel("– / –")
+        self.sample_lbl.setObjectName("valueLabel")
+        self.sample_lbl.setMinimumWidth(60)
+        self.sample_lbl.setAlignment(Qt.AlignCenter)
+        active_row.addWidget(self.sample_lbl)
+        self.sample_next_btn = QPushButton("▶")
+        self.sample_next_btn.setObjectName("octaveBtn")
+        self.sample_next_btn.setEnabled(False)
+        self.sample_next_btn.clicked.connect(lambda: self._step_sample(+1))
+        active_row.addWidget(self.sample_next_btn)
+        active_row.addStretch(1)
+        outer.addLayout(active_row)
 
         # Piano
         self.piano = PianoKeyboardWidget()
@@ -400,11 +547,18 @@ class MainWindow(QMainWindow):
 
         col.addWidget(self._section_header("ANALYSIS"))
 
-        # Cluster mode
-        col.addLayout(self._labeled_row(
-            "MODE",
-            self._make_mode_combo(),
-        ))
+        # Method toggle: clustering OR classification (mutually exclusive)
+        col.addWidget(self._make_method_toggle())
+
+        # Sub-control rows: cluster-mode combo (clustering) / model combo
+        # (classification). Only one is visible, driven by the toggle.
+        self.cluster_mode_row = self._labeled_row_widget(
+            "MODE", self._make_cluster_mode_combo())
+        self.model_row = self._labeled_row_widget(
+            "MODEL", self._make_model_combo())
+        col.addWidget(self.cluster_mode_row)
+        col.addWidget(self.model_row)
+        self.model_row.setVisible(False)
 
         # Manual / Auto / HDBSCAN param (only one visible at a time)
         self.manual_row = self._make_manual_row()
@@ -417,7 +571,7 @@ class MainWindow(QMainWindow):
         self.hdb_row.setVisible(False)
 
         # Sample length (affects analysis — requires Run to apply)
-        self.length_slider = QSlider(Qt.Horizontal)
+        self.length_slider = Knob()
         self.length_slider.setRange(1, 50)   # 0.1s .. 5.0s
         self.length_slider.setValue(5)
         self.length_value_lbl = QLabel("0.5 s")
@@ -436,7 +590,7 @@ class MainWindow(QMainWindow):
         ))
 
         # Noise gate: peak-based, drops whole segments below this threshold
-        self.gate_slider = QSlider(Qt.Horizontal)
+        self.gate_slider = Knob()
         self.gate_slider.setRange(0, 100)
         self.gate_slider.setValue(0)
         self.gate_value_lbl = QLabel("OFF")
@@ -446,7 +600,7 @@ class MainWindow(QMainWindow):
         col.addLayout(self._slider_row("NOISE GATE", self.gate_slider, self.gate_value_lbl))
 
         # Trim threshold: silence-trim edges below this dBFS level
-        self.trim_slider = QSlider(Qt.Horizontal)
+        self.trim_slider = Knob()
         self.trim_slider.setRange(0, 100)
         self.trim_slider.setValue(40)
         self.trim_value_lbl = QLabel("-38 dB")
@@ -455,22 +609,75 @@ class MainWindow(QMainWindow):
         self.trim_slider.valueChanged.connect(self._on_trim_changed)
         col.addLayout(self._slider_row("TRIM THRESHOLD", self.trim_slider, self.trim_value_lbl))
 
+        # Clipper: when on, a sample ends at the next transient; when off it
+        # runs to the trim-threshold decay or the sample-length cap.
+        clip_row = QHBoxLayout()
+        clip_lbl = QLabel("CLIP AT NEXT")
+        clip_lbl.setObjectName("controlLabel")
+        clip_lbl.setMinimumWidth(110)
+        self.clip_check = ToggleSwitch()
+        clip_row.addWidget(clip_lbl)
+        clip_row.addWidget(self.clip_check)
+        clip_row.addStretch(1)
+        col.addLayout(clip_row)
+
         # Progress + status
         col.addWidget(self._progress_bar())
         self.status = QLabel("ready")
         self.status.setObjectName("statusLabel")
         col.addWidget(self.status)
 
+        # 16-step sequencer grid (select a key, then light up its steps).
+        col.addSpacing(4)
+        col.addWidget(self._section_header("SEQUENCER · 16 STEPS"))
+        self.step_grid = StepGrid(steps=N_STEPS)
+        self.step_grid.setActive(False)
+        self.step_grid.stepToggled.connect(self._on_step_toggled)
+        col.addWidget(self.step_grid)
+
         col.addStretch(1)
         return col
 
-    def _make_mode_combo(self) -> QWidget:
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Manual k (KMeans)", "manual")
-        self.mode_combo.addItem("Auto threshold (Agglomerative)", "auto")
-        self.mode_combo.addItem("Auto density (HDBSCAN)", "hdbscan")
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        return self.mode_combo
+    def _make_method_toggle(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        self.btn_cluster = QPushButton("CLUSTERING")
+        self.btn_cluster.setObjectName("toggleLeft")
+        self.btn_cluster.setCheckable(True)
+        self.btn_cluster.setChecked(True)
+        self.btn_classify = QPushButton("CLASSIFICATION")
+        self.btn_classify.setObjectName("toggleRight")
+        self.btn_classify.setCheckable(True)
+        grp = QButtonGroup(w)
+        grp.setExclusive(True)
+        grp.addButton(self.btn_cluster)
+        grp.addButton(self.btn_classify)
+        self.btn_cluster.clicked.connect(lambda: self._set_method("cluster"))
+        self.btn_classify.clicked.connect(lambda: self._set_method("classify"))
+        h.addWidget(self.btn_cluster, 1)
+        h.addWidget(self.btn_classify, 1)
+        return w
+
+    def _make_cluster_mode_combo(self) -> QWidget:
+        self.cluster_mode_combo = QComboBox()
+        self.cluster_mode_combo.addItem("KMeans (manual k)", "manual")
+        self.cluster_mode_combo.addItem("Agglomerative", "auto")
+        self.cluster_mode_combo.addItem("HDBSCAN", "hdbscan")
+        self.cluster_mode_combo.currentIndexChanged.connect(self._on_cluster_mode_changed)
+        return self.cluster_mode_combo
+
+    def _make_model_combo(self) -> QWidget:
+        self.model_combo = QComboBox()
+        for name in available_models():
+            self.model_combo.addItem(MODEL_LABELS.get(name, name), name)
+        if self.model_combo.count() == 0:
+            self.model_combo.addItem("(no models trained)", None)
+        idx = self.model_combo.findData("gb")   # default to best model
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        return self.model_combo
 
     def _make_manual_row(self) -> QWidget:
         w = QWidget()
@@ -529,8 +736,8 @@ class MainWindow(QMainWindow):
         row.addWidget(self.mcs_value_lbl)
         return w
 
-    def _make_sens_slider(self) -> QSlider:
-        self.sens_slider = QSlider(Qt.Horizontal)
+    def _make_sens_slider(self) -> QWidget:
+        self.sens_slider = Knob()
         self.sens_slider.setRange(0, 100)
         self.sens_slider.setValue(50)
         self.sens_value_lbl = QLabel("0.50")
@@ -556,7 +763,7 @@ class MainWindow(QMainWindow):
         col.addWidget(self._section_header("PLAYBACK"))
 
         # Velocity
-        self.vel_slider = QSlider(Qt.Horizontal)
+        self.vel_slider = Knob()
         self.vel_slider.setRange(1, 127)
         self.vel_slider.setValue(100)
         self.vel_value_lbl = QLabel("100")
@@ -565,6 +772,7 @@ class MainWindow(QMainWindow):
         self.vel_slider.valueChanged.connect(
             lambda v: self.vel_value_lbl.setText(str(v))
         )
+        self.vel_slider.valueChanged.connect(self._on_playback_control_changed)
         col.addLayout(self._slider_row("VELOCITY", self.vel_slider, self.vel_value_lbl))
 
         # Loop while held
@@ -572,7 +780,7 @@ class MainWindow(QMainWindow):
         loop_label = QLabel("LOOP")
         loop_label.setObjectName("controlLabel")
         loop_label.setMinimumWidth(110)
-        self.loop_check = QCheckBox("while held")
+        self.loop_check = ToggleSwitch()
         self.loop_check.toggled.connect(self._on_loop_toggled)
         loop_row.addWidget(loop_label)
         loop_row.addWidget(self.loop_check, 1)
@@ -583,8 +791,7 @@ class MainWindow(QMainWindow):
         sort_label = QLabel("PITCH SORT")
         sort_label.setObjectName("controlLabel")
         sort_label.setMinimumWidth(110)
-        self.sort_check = QCheckBox("low → high")
-        self.sort_check.setChecked(True)
+        self.sort_check = ToggleSwitch(checked=True)
         self.sort_check.toggled.connect(self._on_sort_toggled)
         sort_row.addWidget(sort_label)
         sort_row.addWidget(self.sort_check, 1)
@@ -647,7 +854,7 @@ class MainWindow(QMainWindow):
         # LPF
         col.addSpacing(4)
         col.addWidget(self._section_header("FILTER"))
-        self.lpf_slider = QSlider(Qt.Horizontal)
+        self.lpf_slider = Knob()
         self.lpf_slider.setRange(0, 100)
         self.lpf_slider.setValue(100)
         self.lpf_value_lbl = QLabel("20000 Hz")
@@ -697,6 +904,18 @@ class MainWindow(QMainWindow):
         row.addWidget(lbl)
         row.addWidget(widget, 1)
         return row
+
+    def _labeled_row_widget(self, label_text: str, widget: QWidget) -> QWidget:
+        """Same as _labeled_row but wrapped in a QWidget so it can be shown/hidden."""
+        w = QWidget()
+        row = QHBoxLayout(w)
+        row.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(label_text)
+        lbl.setObjectName("controlLabel")
+        lbl.setMinimumWidth(110)
+        row.addWidget(lbl)
+        row.addWidget(widget, 1)
+        return w
 
     def _slider_row(self, label_text: str, slider: QSlider, value_lbl: QLabel) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -778,12 +997,60 @@ class MainWindow(QMainWindow):
         self.file_label.setText(Path(path).name)
         self.run_btn.setEnabled(True)
 
+    def _set_method(self, method: str) -> None:
+        self._method = method
+        is_cluster = method == "cluster"
+        self.btn_cluster.setChecked(is_cluster)
+        self.btn_classify.setChecked(not is_cluster)
+        self.cluster_mode_row.setVisible(is_cluster)
+        self.model_row.setVisible(not is_cluster)
+        # Pitch-sort only applies to clustering; classification uses a fixed
+        # GM drum layout.
+        self.sort_check.setEnabled(is_cluster)
+        self._update_cluster_param_rows()
+
     @Slot()
-    def _on_mode_changed(self) -> None:
-        mode = self.mode_combo.currentData()
-        self.manual_row.setVisible(mode == "manual")
-        self.auto_row.setVisible(mode == "auto")
-        self.hdb_row.setVisible(mode == "hdbscan")
+    def _on_cluster_mode_changed(self) -> None:
+        self._update_cluster_param_rows()
+
+    def _update_cluster_param_rows(self) -> None:
+        cluster = self._method == "cluster"
+        mode = self.cluster_mode_combo.currentData()
+        self.manual_row.setVisible(cluster and mode == "manual")
+        self.auto_row.setVisible(cluster and mode == "auto")
+        self.hdb_row.setVisible(cluster and mode == "hdbscan")
+
+    def _classify_clusters(self) -> None:
+        """Predict an instrument label per cluster via majority vote of its
+        segments. No re-extraction — segments already carry their features."""
+        self._cluster_labels = {}
+        self._cluster_conf = {}
+        if self._model_bundle is None or not self._instrument.notes:
+            return
+        pipe = self._model_bundle["pipeline"]
+        has_proba = hasattr(pipe, "predict_proba")
+        classes = list(pipe.classes_)
+        for ci, segs in self._instrument.notes.items():
+            feats = [s.features for s in segs if getattr(s, "features", None) is not None]
+            if not feats:
+                continue
+            X = np.stack(feats).astype(np.float32)
+            preds = pipe.predict(X)
+            label, votes = Counter(preds).most_common(1)[0]
+            if has_proba:
+                proba = pipe.predict_proba(X)
+                conf = float(proba[:, classes.index(label)].mean())
+            else:
+                conf = votes / len(preds)
+            self._cluster_labels[int(ci)] = str(label)
+            self._cluster_conf[int(ci)] = conf
+
+    def _label_summary(self) -> str:
+        if not self._cluster_labels:
+            return ""
+        counts = Counter(self._cluster_labels.values())
+        parts = [f"{n}×{lab}" for lab, n in counts.most_common()]
+        return "classified: " + ", ".join(parts)
 
     @Slot()
     def _on_run(self) -> None:
@@ -795,7 +1062,34 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.status.setText("starting…")
 
-        mode = self.mode_combo.currentData()
+        classifier_model = None
+        if self._method == "classify":
+            mode = "classify"
+            model_name = self.model_combo.currentData()
+            if model_name is None:
+                self.status.setText("no trained model — run classifier.py --train first.")
+                self.run_btn.setEnabled(True)
+                self.pick_btn.setEnabled(True)
+                return
+            try:
+                bundle = self._model_cache.get(model_name)
+                if bundle is None:
+                    bundle = load_bundle(model_name)
+                    if not isinstance(bundle, dict) or "pipeline" not in bundle:
+                        raise ValueError("bundle missing 'pipeline'")
+                    self._model_cache[model_name] = bundle
+                self._model_bundle = bundle
+                classifier_model = bundle["pipeline"]
+            except Exception as exc:  # noqa: BLE001
+                self.status.setText(f"could not load model '{model_name}': {exc}")
+                self.run_btn.setEnabled(True)
+                self.pick_btn.setEnabled(True)
+                return
+        else:
+            mode = self.cluster_mode_combo.currentData()  # manual / auto / hdbscan
+            self._model_bundle = None  # clustering mode shows no labels
+        self._result_is_classify = (mode == "classify")
+
         threshold = self._threshold_from_slider(self.thresh_slider.value())
         min_cluster_size = self._min_cluster_size_from_slider(self.mcs_slider.value())
         noise_gate_db = self._volume_gate_db_from_slider(self.gate_slider.value())
@@ -812,6 +1106,8 @@ class MainWindow(QMainWindow):
             segment_length_s=self.length_slider.value() / 10.0,
             trim_threshold_db=trim_threshold_db,
             noise_gate_db=noise_gate_db,
+            classifier_model=classifier_model,
+            clip_at_next_onset=self.clip_check.isChecked(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -836,9 +1132,23 @@ class MainWindow(QMainWindow):
         self._all_segments = [s for segs in instrument.notes.values() for s in segs]
         loaded = instrument.loaded_notes()
         self._octave = 0
+        # Fresh instrument → reset sample choice, selection, and step patterns.
+        self._sample_choice = {}
+        self._selected_key = None
+        self._patterns = {}
+        self.piano.set_selected(None)
+        self.active_led.setOn(False)
+        self.active_lbl.setText("—")
+        self._update_sample_selector()
+        self.step_grid.setActive(False)
+        self.step_grid.setPattern([False] * N_STEPS)
+        self._classify_clusters()
         self._refresh_octave_view()
         if loaded:
             self.view_btn.setEnabled(True)
+            summary = self._label_summary()
+            if summary:
+                self.status.setText(self.status.text() + "  ·  " + summary)
         else:
             self.view_btn.setEnabled(False)
             self.status.setText("0 keys loaded — try raising sensitivity or lowering threshold.")
@@ -866,21 +1176,81 @@ class MainWindow(QMainWindow):
         dlg = ClusterViewerDialog(
             self._instrument, self._engine,
             get_gain=lambda: self.vel_slider.value() / 127.0,
+            labels=self._cluster_labels,
+            confidences=self._cluster_conf,
             parent=self,
         )
         dlg.exec()
 
     @Slot()
     def _on_adsr_changed(self) -> None:
-        self._sync_adsr_to_engine()
+        a, d, s, r = self._adsr_values()
+        self.adsr_viz.set_adsr(a, d, s, r)
+        self._store_controls_to_active()
 
     @Slot()
     def _on_lpf_changed(self) -> None:
-        self._sync_lpf_to_engine()
+        self._store_controls_to_active()
+
+    @Slot()
+    def _on_playback_control_changed(self) -> None:
+        self._store_controls_to_active()
 
     @Slot(bool)
     def _on_loop_toggled(self, checked: bool) -> None:
-        self._engine.set_loop_enabled(checked)
+        self._store_controls_to_active()
+
+    # ---------- per-sample playback settings ----------
+
+    def _active_segment(self):
+        """The Segment for the selected key + chosen sample, or None."""
+        key = self._selected_key
+        if key is None:
+            return None
+        segs = self._instrument.notes.get(key)
+        if not segs:
+            return None
+        idx = self._sample_choice.get(key, 0) % len(segs)
+        return segs[idx]
+
+    def _settings_for(self, seg) -> PlaybackSettings:
+        """Get (creating if needed) the PlaybackSettings stored on a segment."""
+        if seg.playback is None:
+            seg.playback = PlaybackSettings()
+        return seg.playback
+
+    def _store_controls_to_active(self) -> None:
+        """Write the current control values into the active sample's settings."""
+        if self._loading_settings:
+            return
+        seg = self._active_segment()
+        if seg is None:
+            return
+        seg.playback = PlaybackSettings(
+            velocity=self.vel_slider.value(),
+            loop=self.loop_check.isChecked(),
+            a=self.a_slider.value(),
+            d=self.d_slider.value(),
+            s=self.s_slider.value(),
+            r=self.r_slider.value(),
+            lpf=self.lpf_slider.value(),
+        )
+
+    def _load_settings_into_controls(self, st: PlaybackSettings) -> None:
+        """Push a sample's settings into the controls without writing back."""
+        self._loading_settings = True
+        try:
+            self.vel_slider.setValue(st.velocity)
+            self.loop_check.setChecked(st.loop)
+            self.a_slider.setValue(st.a)
+            self.d_slider.setValue(st.d)
+            self.s_slider.setValue(st.s)
+            self.r_slider.setValue(st.r)
+            self.lpf_slider.setValue(st.lpf)
+        finally:
+            self._loading_settings = False
+        a, d, s, r = self._adsr_values()
+        self.adsr_viz.set_adsr(a, d, s, r)
 
     @Slot(int)
     def _on_gate_changed(self, v: int) -> None:
@@ -897,7 +1267,8 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _on_sort_toggled(self, checked: bool) -> None:
-        if not self._all_segments:
+        if not self._all_segments or self._result_is_classify:
+            # Classification uses a fixed GM drum layout — never re-sort it.
             return
         # Cluster->key mapping is about to change, so release anything held.
         for n in list(self.piano._pressed):  # type: ignore[attr-defined]
@@ -908,6 +1279,7 @@ class MainWindow(QMainWindow):
             self._all_segments, sort_by_freq=checked
         )
         self._octave = 0
+        self._classify_clusters()
         self._refresh_octave_view()
 
     def _sync_adsr_to_engine(self) -> None:
@@ -947,12 +1319,20 @@ class MainWindow(QMainWindow):
             if base <= ci <= base + N_VISIBLE_KEYS - 1
         }
         self.piano.set_loaded(loaded_in_octave)
+        # In classification mode each loaded key shows its fixed drum-layout cap
+        # (KICK, SNR1, HH2, …). Clustering mode shows no labels.
+        if self._result_is_classify:
+            key_labels = {n: KEY_CAP_LABEL[n] for n in loaded_in_octave
+                          if n in KEY_CAP_LABEL}
+        else:
+            key_labels = {}
+        self.piano.set_key_labels(key_labels)
         self.oct_value_lbl.setText(f"{self._octave} / {max_o}")
         self.oct_down_btn.setEnabled(self._octave > 0)
         self.oct_up_btn.setEnabled(self._octave < max_o)
 
     # ============================================================
-    # note triggering (with velocity-layered crossfade)
+    # note triggering — sample cycling + velocity volume/lowpass
     # ============================================================
 
     @Slot(int)
@@ -962,29 +1342,83 @@ class MainWindow(QMainWindow):
         if not segs:
             return
 
-        velocity = self.vel_slider.value()      # 1..127
-        master_gain = velocity / 127.0
+        # Pressing a key selects it (for arrows / sequencer / active light).
+        self._select_key(cluster_idx, note_index)
+        self._play_selected_sample(cluster_idx)
 
-        if len(segs) == 1:
-            self._engine.play(segs[0].audio, gain=master_gain, note_id=cluster_idx)
+    def _play_selected_sample(self, cluster_idx: int) -> None:
+        """Play the currently chosen sample on a key using that sample's own
+        playback settings (envelope, velocity, loop, filter)."""
+        segs = self._instrument.notes.get(cluster_idx)
+        if not segs:
             return
+        idx = self._sample_choice.get(cluster_idx, 0) % len(segs)
+        seg = segs[idx]
+        st = self._settings_for(seg)
+        gain = st.velocity / 127.0
+        adsr = (st.a * 0.01, st.d * 0.01, st.s / 100.0, st.r * 0.02)
+        cutoff_hz = self._lpf_from_slider(st.lpf)
+        # Velocity also applies the subtle darkening lowpass on top of the
+        # per-sample filter.
+        audio = velocity_lowpass(seg.audio, st.velocity)
+        self._engine.play(audio, gain=gain, note_id=cluster_idx,
+                          adsr=adsr, cutoff_hz=cutoff_hz, loop=st.loop)
 
-        # Velocity layering with equal-power crossfade between adjacent layers.
-        # Fractional position in [0, N-1]
-        pos = (velocity - 1) / 126.0 * (len(segs) - 1)
-        lo = int(math.floor(pos))
-        hi = min(lo + 1, len(segs) - 1)
-        frac = pos - lo
+    def _select_key(self, cluster_idx: int, note_index: int) -> None:
+        """Mark a key active: outline it, light the indicator, wire the arrow
+        sample-selector, load the active sample's settings, show its pattern."""
+        self._selected_key = cluster_idx
+        self.piano.set_selected(note_index)
+        # The drum layout is a single fixed octave, so the visible key index
+        # (0..16) is the cap-label key.
+        cap = KEY_CAP_LABEL.get(note_index, f"KEY {cluster_idx}")
+        self.active_led.setOn(True)
+        self.active_lbl.setText(cap)
+        self._update_sample_selector()
+        seg = self._active_segment()
+        if seg is not None:
+            self._load_settings_into_controls(self._settings_for(seg))
+        pattern = self._patterns.setdefault(cluster_idx, [False] * N_STEPS)
+        self.step_grid.setActive(True)
+        self.step_grid.setPattern(pattern)
 
-        if lo == hi:
-            self._engine.play(segs[lo].audio, gain=master_gain, note_id=cluster_idx)
+    def _update_sample_selector(self) -> None:
+        """Refresh the ◀ N/M ▶ readout for the selected key."""
+        key = self._selected_key
+        segs = self._instrument.notes.get(key) if key is not None else None
+        n = len(segs) if segs else 0
+        has = n > 0
+        self.sample_prev_btn.setEnabled(has and n > 1)
+        self.sample_next_btn.setEnabled(has and n > 1)
+        if not has:
+            self.sample_lbl.setText("– / –")
             return
+        idx = self._sample_choice.get(key, 0) % n
+        self.sample_lbl.setText(f"{idx + 1} / {n}")
 
-        # Equal-power (cos/sin) curves keep perceived loudness uniform.
-        w_lo = math.cos(frac * math.pi / 2.0)
-        w_hi = math.sin(frac * math.pi / 2.0)
-        self._engine.play(segs[lo].audio, gain=master_gain * w_lo, note_id=cluster_idx)
-        self._engine.play(segs[hi].audio, gain=master_gain * w_hi, note_id=cluster_idx)
+    def _step_sample(self, delta: int) -> None:
+        """Tab the chosen sample for the active key and audition it."""
+        key = self._selected_key
+        segs = self._instrument.notes.get(key) if key is not None else None
+        if not segs:
+            return
+        n = len(segs)
+        idx = (self._sample_choice.get(key, 0) + delta) % n
+        self._sample_choice[key] = idx
+        self._update_sample_selector()
+        # Load the newly chosen sample's settings into the controls.
+        seg = self._active_segment()
+        if seg is not None:
+            self._load_settings_into_controls(self._settings_for(seg))
+        self._play_selected_sample(key)   # audition the newly chosen sample
+
+    @Slot(int)
+    def _on_step_toggled(self, step: int) -> None:
+        if self._selected_key is None:
+            return
+        pattern = self._patterns.setdefault(self._selected_key, [False] * N_STEPS)
+        pattern[step] = not pattern[step]
+        self.step_grid.setPattern(pattern)
 
     @Slot(int)
     def _on_note_released(self, note_index: int) -> None:

@@ -19,3 +19,9 @@ env/
 
 # Large sample/training audio (not source — keep out of the repo)
 training data/
+
+# Regenerable feature/analysis caches (rebuild via classifier.py --extract)
+*.npz
+
+# Operational logs from the sample sorter (reference training-data ops)
+*_manifest_*.csv
