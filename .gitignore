@@ -20,6 +20,9 @@ env/
 # Large sample/training audio (not source — keep out of the repo)
 training data/
 
+# External datasets pulled for classifier training (StemGMD, Freesound, etc.)
+datasets/
+
 # Regenerable feature/analysis caches (rebuild via classifier.py --extract)
 *.npz
 

@@ -22,7 +22,10 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import load_audio, trim_silence, compute_features, TARGET_SR
+from pipeline import (
+    load_audio, trim_silence, features_from_oneshot, TARGET_SR,
+    MIN_SEGMENT_SAMPLES,
+)
 from sort_samples import classify as name_classify
 from classifier import make_model, MODEL_NAMES
 
@@ -55,13 +58,20 @@ def extract() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
                 audio = load_audio(str(f))
             except Exception:
                 continue
-            audio = trim_silence(audio)
-            if audio.size < 256:
+            # Duration of the source one-shot (for the train/serve skew report).
+            full = trim_silence(audio)
+            if full.size < MIN_SEGMENT_SAMPLES:
                 continue
-            X.append(compute_features(audio))
+            # Features via the SAME path serving uses (front-trim → cap → tail-
+            # trim → normalize → compute_features), so the analysis reflects the
+            # de-skewed pipeline rather than whole-one-shot features.
+            result = features_from_oneshot(audio)
+            if result is None:
+                continue
+            X.append(result[1])
             y.append(label)
             groups.append(group)
-            durs.append(audio.size / float(TARGET_SR))
+            durs.append(full.size / float(TARGET_SR))
             n += 1
         print(f"  [{mi+1:3d}/{len(machines)}] {group[:34]:34s} {n:4d}")
     return (np.asarray(X, np.float32), np.asarray(y),
@@ -98,7 +108,8 @@ def analyze() -> None:
     over = float((durs > 0.5).mean()) * 100
     print("\n=== TRAIN/SERVE SKEW (one-shot trimmed duration) ===")
     print(f"  median {pcts[0]:.2f}s · p75 {pcts[1]:.2f}s · p90 {pcts[2]:.2f}s · p99 {pcts[3]:.2f}s")
-    print(f"  {over:.0f}% of training one-shots are LONGER than the 0.5s segment cap used at inference")
+    print(f"  {over:.0f}% of source one-shots are longer than the 0.5s cap — but features are")
+    print(f"  now extracted from the capped slice via features_from_oneshot (skew eliminated)")
 
     # ---- leakage: random CV vs leave-one-machine-out CV ----
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)

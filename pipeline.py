@@ -38,7 +38,16 @@ NOTE_NAMES = [
 ]
 NOTE_NAMES_12 = NOTE_NAMES[:12]   # 12 unique pitch classes
 
-SEGMENT_LENGTH_S = 0.5
+SEGMENT_LENGTH_S = 0.5            # default PLAYBACK capture length (user-adjustable)
+
+# Fixed window the CLASSIFIER features are always computed over, decoupled from
+# the user's "Sample Len" slider. A trained model is a fixed artifact; if the
+# classify feature window tracked the slider, moving it would feed the model
+# out-of-distribution slices (train/serve skew). Training (features_from_oneshot)
+# and classification serving both use THIS value, so they can never drift. Must
+# match the window the saved models/*.joblib were trained on. Clustering mode is
+# self-consistent per run, so it keeps using the slider, not this.
+CLASSIFY_FEATURE_LEN_S = 0.5
 MIN_SEGMENT_S = 0.05
 MIN_ONSET_GAP_S = 0.10            # reject onsets less than 100ms apart
 TRIM_THRESHOLD_DB_DEFAULT = -38.0 # default silence threshold for trim (dBFS)
@@ -83,6 +92,10 @@ class Segment:
     dominant_freq: float = 0.0   # FFT peak frequency, used for key ordering
     label: str = ""              # predicted class (classification mode)
     playback: object = None      # per-sample PlaybackSettings (set by the GUI)
+    # The fixed-window slice the classifier features were computed on (classify
+    # mode only). Embedding-based classifiers re-embed THIS, not `audio` (the
+    # variable-length playback slice), to stay train/serve-consistent.
+    classify_audio: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -222,6 +235,100 @@ def dominant_frequency(audio: np.ndarray, sr: int = TARGET_SR) -> float:
     return float(freqs[int(strong[0])])
 
 
+def low_band_f0(
+    audio: np.ndarray,
+    sr: int = TARGET_SR,
+    fmin: float = 40.0,
+    fmax: float = 400.0,
+) -> float:
+    """Resonant fundamental in the drum body's low band (Hz), or 0.0.
+
+    Unlike `dominant_frequency` (which finds the lowest strong peak anywhere),
+    this peak-picks the magnitude spectrum strictly within [fmin, fmax] — the
+    band where a tom/kick's membrane fundamental lives. This is the feature that
+    separates high/mid/low toms, which differ by pitch, not timbre, and which
+    MFCCs and semantic embeddings (CLAP) cannot resolve.
+
+    The first ~5 ms of broadband attack is skipped so the transient doesn't
+    swamp the sustained resonance.
+    """
+    if audio.size < 256:
+        return 0.0
+    skip = min(int(0.005 * sr), audio.size // 4)  # drop the attack click
+    body = audio[skip:]
+    n_fft = 8192
+    n = min(body.size, n_fft)
+    windowed = body[:n].astype(np.float64) * np.hanning(n)
+    if n < n_fft:
+        padded = np.zeros(n_fft, dtype=np.float64)
+        padded[:n] = windowed
+        windowed = padded
+    spec = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    band = (freqs >= fmin) & (freqs <= fmax)
+    if not band.any():
+        return 0.0
+    band_spec = spec[band]
+    if float(band_spec.max()) < 1e-10:
+        return 0.0
+    return float(freqs[band][int(np.argmax(band_spec))])
+
+
+def _hz_to_midi(f0: float) -> float:
+    """Log-pitch (MIDI note number) for f0>0, else 0. Log scaling makes the
+    hi/mid/lo tom spacing roughly linear, which classifiers separate better."""
+    if f0 <= 0.0:
+        return 0.0
+    return 69.0 + 12.0 * np.log2(f0 / 440.0)
+
+
+def pitch_temporal_features(audio: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
+    """Compact 5-dim scalar vector to fuse onto an audio embedding (brief §3).
+
+    Targets what timbre embeddings miss: pitch (the tom problem) and gross
+    amplitude-envelope shape.
+      [0] f0_hz            low-band resonant fundamental
+      [1] f0_midi          log-scaled pitch (linear hi/mid/lo spacing)
+      [2] log_attack_time  log seconds from onset to envelope peak
+      [3] temporal_centroid  envelope centre of mass (s) — decay character
+      [4] decay_slope      slope of the log-envelope after the peak (1/s, <=0)
+    """
+    if audio.size < 256:
+        return np.zeros(5, dtype=np.float32)
+
+    f0 = low_band_f0(audio, sr)
+    f0_midi = _hz_to_midi(f0)
+
+    # Smoothed amplitude envelope.
+    env = np.abs(audio).astype(np.float64)
+    if env.size > TRIM_SMOOTH_SAMPLES:
+        pad = TRIM_SMOOTH_SAMPLES // 2
+        kernel = np.ones(TRIM_SMOOTH_SAMPLES) / TRIM_SMOOTH_SAMPLES
+        env = np.convolve(np.pad(env, pad, mode="edge"), kernel, "valid")[:audio.size]
+    peak_idx = int(np.argmax(env))
+    peak = float(env[peak_idx]) or 1e-9
+
+    log_attack_time = float(np.log10(max(peak_idx / sr, 1e-4)))
+
+    t = np.arange(env.size) / sr
+    esum = float(env.sum()) or 1e-9
+    temporal_centroid = float((t * env).sum() / esum)
+
+    # Decay slope: linear fit of log-envelope from peak to end (negative = decays).
+    decay = env[peak_idx:]
+    if decay.size > 8:
+        log_decay = np.log(np.clip(decay / peak, 1e-6, None))
+        td = t[peak_idx:peak_idx + decay.size] - t[peak_idx]
+        decay_slope = float(np.polyfit(td, log_decay, 1)[0])
+    else:
+        decay_slope = 0.0
+
+    return np.array(
+        [f0, f0_midi, log_attack_time, temporal_centroid, decay_slope],
+        dtype=np.float32,
+    )
+
+
 def _tail_end_index(
     chunk: np.ndarray,
     threshold_db: float,
@@ -260,6 +367,50 @@ def normalize_sample(audio: np.ndarray, peak_target: float = 0.95) -> np.ndarray
     return (audio * (peak_target / peak)).astype(np.float32, copy=False)
 
 
+def segment_features(
+    chunk: np.ndarray,
+    trim_threshold_db: float = TRIM_THRESHOLD_DB_DEFAULT,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """THE canonical 'audio slice -> (processed sample, 57-dim features)' path.
+
+    This is the single implementation shared by the live pipeline AND classifier
+    training, so train-time and serve-time features cannot drift (train/serve
+    skew). `chunk` must already start at the transient and be capped to the
+    desired maximum length (the caller applies the segment-length cap / clip-at-
+    next-onset). Here we tail-trim, peak-normalize, and featurize — identically
+    for both paths.
+
+    Returns (sample, features), or None if the slice is shorter than the minimum
+    usable length before or after tail-trimming.
+    """
+    if chunk.size < MIN_SEGMENT_SAMPLES:
+        return None
+    tail = _tail_end_index(chunk, trim_threshold_db)
+    if tail < MIN_SEGMENT_SAMPLES:
+        return None
+    sample = normalize_sample(chunk[:tail])
+    return sample, compute_features(sample)
+
+
+def features_from_oneshot(
+    audio: np.ndarray,
+    trim_threshold_db: float = TRIM_THRESHOLD_DB_DEFAULT,
+    feature_length_s: float = CLASSIFY_FEATURE_LEN_S,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Push a full one-shot through the SAME segmentation classification serving
+    uses, so train-time and serve-time classifier features cannot drift.
+
+    Training bins hold clean full-length one-shots, but at inference the model
+    only sees onset-aligned, length-capped, tail-trimmed, peak-normalized slices.
+    The cap here is the FIXED CLASSIFY_FEATURE_LEN_S (not the user's playback
+    Sample Len) — see that constant. Front-trim to the transient, cap, then run
+    the shared `segment_features`. Returns (sample, features) or None.
+    """
+    audio = trim_silence(audio, trim_threshold_db)
+    cap = int(feature_length_s * TARGET_SR)
+    return segment_features(audio[:cap], trim_threshold_db)
+
+
 def extract_segments(
     audio: np.ndarray,
     onset_times: np.ndarray,
@@ -267,6 +418,7 @@ def extract_segments(
     trim_threshold_db: float = TRIM_THRESHOLD_DB_DEFAULT,
     noise_gate_db: Optional[float] = None,
     clip_at_next_onset: bool = False,
+    feature_length_s: Optional[float] = None,
 ) -> list[Segment]:
     """Grab one normalized sample per transient, per the data-pipeline spec:
 
@@ -281,6 +433,12 @@ def extract_segments(
       4. Drop if shorter than MIN_SEGMENT_S.
       5. Normalize each surviving sample to a common peak.
       6. Exact-bytes dedupe as a safety net.
+
+    `feature_length_s`: if given (classification mode passes CLASSIFY_FEATURE_LEN_S),
+    the stored feature vector is computed over a FIXED window from the onset,
+    independent of the playback sample's length — so the slider can't reintroduce
+    train/serve skew. The played `audio` still uses the user's segment_length_s.
+    If None (clustering mode), features come from the played sample, as before.
     """
     segment_samples = int(segment_length_s * TARGET_SR)
     segments: list[Segment] = []
@@ -305,19 +463,29 @@ def extract_segments(
             continue
 
         # Noise gate: drop the whole transient if it never gets loud enough.
+        # (Serving-only — training keeps every labeled sample.)
         peak = float(np.abs(chunk).max())
         if peak < gate_linear:
             continue
 
-        # End the sample where its tail decays below the trim threshold (never
-        # trims the front — the chunk already begins at the transient).
-        tail = _tail_end_index(chunk, trim_threshold_db)
-        if tail < MIN_SEGMENT_SAMPLES:
+        # Tail-trim, normalize, and featurize via the shared train/serve path.
+        # `sample`/`feats` describe the played slice (user's segment_length_s).
+        result = segment_features(chunk, trim_threshold_db)
+        if result is None:
             continue
-        sample = chunk[:tail]
+        sample, feats = result
 
-        # Normalize each sample individually.
-        sample = normalize_sample(sample)
+        # Classification: recompute the feature vector over the FIXED window so
+        # it matches training regardless of the playback length. Ignores
+        # clip-at-next (training doesn't clip). Falls back to the played slice's
+        # features if the fixed window is unusable. Also stash the fixed-window
+        # slice so embedding classifiers can re-embed it consistently.
+        classify_audio = None
+        if feature_length_s is not None:
+            fcap = int(feature_length_s * TARGET_SR)
+            fresult = segment_features(audio[start:start + fcap], trim_threshold_db)
+            if fresult is not None:
+                classify_audio, feats = fresult
 
         # Exact-bytes guard against perfect duplicates.
         h = hash(sample.tobytes())
@@ -326,7 +494,6 @@ def extract_segments(
         seen_hashes.add(h)
 
         rms = float(np.sqrt(np.mean(sample.astype(np.float64) ** 2)))
-        feats = compute_features(sample)
         dom_freq = dominant_frequency(sample)
         segments.append(
             Segment(
@@ -335,6 +502,7 @@ def extract_segments(
                 features=feats,
                 rms=rms,
                 dominant_freq=dom_freq,
+                classify_audio=classify_audio,
             )
         )
 
@@ -394,8 +562,15 @@ def compute_features(audio: np.ndarray) -> np.ndarray:
     return vec.astype(np.float32, copy=False)
 
 
-def _normalize_features(segments: list[Segment]) -> np.ndarray:
-    X = np.stack([s.features for s in segments]).astype(np.float64)
+def _normalize_features(segments: list[Segment],
+                        feature_matrix: Optional[np.ndarray] = None) -> np.ndarray:
+    """Z-score the clustering features. By default uses each segment's 57-dim
+    hand-crafted vector; pass `feature_matrix` (e.g. CLAP+pitch embeddings) to
+    cluster in a different space instead."""
+    if feature_matrix is None:
+        X = np.stack([s.features for s in segments]).astype(np.float64)
+    else:
+        X = np.asarray(feature_matrix, dtype=np.float64)
     mean = X.mean(axis=0)
     std = X.std(axis=0) + 1e-8
     return (X - mean) / std
@@ -452,11 +627,12 @@ def _dedup_similar_segments(
     return [s for i, s in enumerate(segments) if keep[i]]
 
 
-def cluster_segments(segments: list[Segment], n_clusters: int) -> list[Segment]:
+def cluster_segments(segments: list[Segment], n_clusters: int,
+                     feature_matrix: Optional[np.ndarray] = None) -> list[Segment]:
     if not segments:
         return segments
     n_clusters = max(1, min(n_clusters, len(segments)))
-    Xn = _normalize_features(segments)
+    Xn = _normalize_features(segments, feature_matrix)
     km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
     labels = km.fit_predict(Xn)
     for seg, lab in zip(segments, labels):
@@ -464,13 +640,14 @@ def cluster_segments(segments: list[Segment], n_clusters: int) -> list[Segment]:
     return segments
 
 
-def cluster_segments_auto(segments: list[Segment], threshold: float) -> list[Segment]:
+def cluster_segments_auto(segments: list[Segment], threshold: float,
+                          feature_matrix: Optional[np.ndarray] = None) -> list[Segment]:
     if not segments:
         return segments
     if len(segments) == 1:
         segments[0].cluster = 0
         return segments
-    Xn = _normalize_features(segments)
+    Xn = _normalize_features(segments, feature_matrix)
     ac = AgglomerativeClustering(
         n_clusters=None, distance_threshold=float(threshold), linkage="ward"
     )
@@ -480,7 +657,8 @@ def cluster_segments_auto(segments: list[Segment], threshold: float) -> list[Seg
     return segments
 
 
-def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int) -> list[Segment]:
+def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int,
+                             feature_matrix: Optional[np.ndarray] = None) -> list[Segment]:
     """Density-based clustering.
 
     Configuration choices that make HDBSCAN actually sensitive on noisy
@@ -510,7 +688,7 @@ def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int) -> 
         segments[0].cluster = 0
         return segments
 
-    Xn = _normalize_features(segments)
+    Xn = _normalize_features(segments, feature_matrix)
     n = len(segments)
     # Cap mcs at half the dataset — asking for clusters larger than that
     # guarantees almost everything ends up as noise.
@@ -588,21 +766,191 @@ for _k, _c, _lab in DRUM_KEYMAP:
 KEY_CAP_LABEL: dict[int, str] = {k: lab for k, _c, lab in DRUM_KEYMAP}
 
 
-def classify_segments(segments: list[Segment], model) -> list[Segment]:
+def classify_feature_matrix(segments: list[Segment], feature_type: str) -> np.ndarray:
+    """Feature matrix for a classifier, matching how its model was trained.
+
+    "hand"       : the 57-dim hand-crafted vector already on each segment.
+    "fused_clap" : CLAP audio embedding ++ pitch/temporal scalars (brief §2+§3),
+                   computed on the fixed-window `classify_audio` slice so it
+                   stays train/serve-consistent (§1). The heavy embedder is
+                   imported lazily, so clustering users never pay for torch.
+    """
+    if feature_type == "fused_clap":
+        from embedders import get_embedder
+        emb = get_embedder("clap")
+        audios = [s.classify_audio if s.classify_audio is not None else s.audio
+                  for s in segments]
+        E = emb.embed_batch(audios, TARGET_SR)
+        P = np.stack([pitch_temporal_features(a) for a in audios])
+        return np.hstack([E, P]).astype(np.float64)
+    return np.stack([s.features for s in segments]).astype(np.float64)
+
+
+def _classify_ensemble(segments: list[Segment], members: list) -> None:
+    """Majority-vote consensus across several models (brief-style ensemble).
+
+    `members` is a list of (fitted_pipeline, feature_type). Each model votes its
+    predicted label per segment; the most-voted label wins. Ties break toward the
+    earlier member (callers order the strongest model first). Feature matrices are
+    computed once per distinct feature_type and reused, so the CLAP embedding pass
+    runs at most once.
+    """
+    from collections import Counter
+    ballots: list[list[str]] = [[] for _ in segments]
+    feat_cache: dict[str, np.ndarray] = {}
+    for pipe, ftype in members:
+        if ftype not in feat_cache:
+            feat_cache[ftype] = classify_feature_matrix(segments, ftype)
+        preds = pipe.predict(feat_cache[ftype])
+        for i, p in enumerate(preds):
+            ballots[i].append(str(p))
+    for seg, votes in zip(segments, ballots):
+        seg.label = Counter(votes).most_common(1)[0][0]
+
+
+def classify_segments(segments: list[Segment], model,
+                      feature_type: str = "hand") -> list[Segment]:
     """Tag each segment with its predicted class label (stored on seg.label).
     The fixed-layout key placement happens in build_instrument_drumkeys.
 
-    `model` is any fitted sklearn classifier exposing predict() over the 57-dim
-    feature vector. Kept model-agnostic on purpose — pipeline.py must not import
-    classifier.py (that would be circular); the GUI passes the loaded model in.
+    `model` is any fitted sklearn classifier exposing predict() over the feature
+    matrix selected by `feature_type`. Special case: feature_type=="ensemble"
+    means `model` is a list of (pipeline, feature_type) members to majority-vote.
+    Kept model-agnostic on purpose — pipeline.py must not import classifier.py
+    (that would be circular); the GUI passes the loaded model(s) in.
     """
     if not segments:
         return segments
-    X = np.stack([s.features for s in segments]).astype(np.float64)
+    if feature_type == "ensemble":
+        _classify_ensemble(segments, model)
+        return segments
+    X = classify_feature_matrix(segments, feature_type)
     preds = model.predict(X)
     for seg, p in zip(segments, preds):
         seg.label = str(p)
     return segments
+
+
+def cluster_consensus(segments: list[Segment], model,
+                      feature_matrix: np.ndarray) -> dict[int, tuple[str, float]]:
+    """Type each CLUSTER by SOFT CONSENSUS and return {cluster_id: (label, conf)}.
+
+    For each cluster, average the classifier's per-slice class probabilities and
+    take the argmax — so the cluster is typed as a whole (robust to a few noisy
+    per-slice predictions). `conf` is that mean winning probability, used by hard
+    placement to rank which cluster best deserves a contested key. Mutates
+    seg.label.
+    """
+    if not segments:
+        return {}
+    X = feature_matrix
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        classes = np.asarray(model.classes_)
+    else:  # hard fallback: one-hot the discrete predictions
+        preds = model.predict(X)
+        classes = np.asarray(sorted(set(map(str, preds))))
+        idx_of = {c: i for i, c in enumerate(classes)}
+        proba = np.zeros((len(preds), len(classes)), dtype=float)
+        for i, p in enumerate(preds):
+            proba[i, idx_of[str(p)]] = 1.0
+
+    by_cluster: dict[int, list[int]] = {}
+    for i, s in enumerate(segments):
+        by_cluster.setdefault(s.cluster, []).append(i)
+    info: dict[int, tuple[str, float]] = {}
+    for cid, rows in by_cluster.items():
+        mean = proba[rows].mean(axis=0)
+        j = int(mean.argmax())
+        label = str(classes[j])
+        info[cid] = (label, float(mean[j]))
+        for i in rows:
+            segments[i].label = label
+    return info
+
+
+def build_instrument_drumkeys_hard(
+    segments: list[Segment],
+    cluster_info: dict[int, tuple[str, float]],
+    n_keys: int = MAX_KEYS,
+) -> Instrument:
+    """Place clusters on the drum kit ONE PER KEY — no doubling up.
+
+    Each drum key holds at most one cluster. Clusters are placed in order of
+    confidence: the most confident cluster claims the first free key of its type
+    (the "most kick-like cluster" really does win KICK). When a type's keys are
+    all taken, that cluster overflows to the nearest remaining empty drum key
+    rather than stacking — so distinct clusters stay on distinct keys.
+    """
+    if not segments:
+        return Instrument()
+    clusters: dict[int, list[Segment]] = {}
+    for s in segments:
+        clusters.setdefault(s.cluster, []).append(s)
+
+    drum_keys = [k for k, _c, _l in DRUM_KEYMAP]          # 0..16, layout order
+    taken: set[int] = set()
+    inst = Instrument()
+    # Most confident clusters get first pick of their type's keys.
+    for cid in sorted(clusters, key=lambda c: cluster_info.get(c, ("", 0.0))[1],
+                      reverse=True):
+        label = cluster_info.get(cid, ("", 0.0))[0]
+        prefs = [k for k in CLASS_KEYS.get(label, []) if k not in taken]
+        if prefs:
+            key = prefs[0]
+        else:
+            spill = [k for k in drum_keys if k not in taken]
+            if not spill:
+                continue  # kit full (>17 clusters) — drop the overflow
+            key = spill[0]
+        taken.add(key)
+        segs = sorted(clusters[cid], key=lambda s: s.rms)
+        for s in segs:
+            s.cluster = key
+        if 0 <= key < n_keys:
+            inst.notes[key] = segs
+    return inst
+
+
+def build_instrument_drumkeys_by_cluster(
+    segments: list[Segment], n_keys: int = MAX_KEYS) -> Instrument:
+    """Place whole CLUSTERS onto the drum kit by their consensus type.
+
+    Unlike build_instrument_drumkeys (which round-robins individual slices and
+    so mixes clusters), this keeps each cluster intact: every cluster lands as a
+    unit on a key of its type. When a type has several clusters, they spread
+    across that type's keys (largest cluster first), so e.g. two snare-ish
+    clusters take SNR1 and SNR2 rather than being blended.
+    """
+    if not segments:
+        return Instrument()
+    clusters: dict[int, list[Segment]] = {}
+    for s in segments:
+        clusters.setdefault(s.cluster, []).append(s)
+
+    # Group clusters by their (shared) consensus label.
+    by_label: dict[str, list[list[Segment]]] = {}
+    for segs in clusters.values():
+        by_label.setdefault(segs[0].label, []).append(segs)
+
+    by_key: dict[int, list[Segment]] = {}
+    for label, clist in by_label.items():
+        keys = CLASS_KEYS.get(label)
+        if not keys:
+            continue  # type with no key on this layout — dropped
+        clist.sort(key=len, reverse=True)  # biggest cluster takes the first key
+        for i, segs in enumerate(clist):
+            k = keys[i % len(keys)]
+            for s in segs:
+                s.cluster = k
+            by_key.setdefault(k, []).extend(segs)
+
+    inst = Instrument()
+    for k, segs in by_key.items():
+        if 0 <= k < n_keys:
+            segs.sort(key=lambda s: s.rms)
+            inst.notes[k] = segs
+    return inst
 
 
 def build_instrument_drumkeys(segments: list[Segment], n_keys: int = MAX_KEYS) -> Instrument:
@@ -694,6 +1042,8 @@ def run_pipeline(
     noise_gate_db: Optional[float] = None,
     n_keys: int = MAX_KEYS,
     classifier_model=None,
+    classifier_feature_type: str = "hand",
+    cluster_clap_mode: str = "off",   # off | soft | hard (clustering placement)
     clip_at_next_onset: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Instrument:
@@ -717,6 +1067,9 @@ def run_pipeline(
         trim_threshold_db=trim_threshold_db,
         noise_gate_db=noise_gate_db,
         clip_at_next_onset=clip_at_next_onset,
+        # Classification features come from a fixed window so the Sample Len
+        # slider can't reintroduce train/serve skew; clustering uses the slider.
+        feature_length_s=(CLASSIFY_FEATURE_LEN_S if mode == "classify" else None),
     )
     if not segments:
         report("No usable segments — all were silent, too short, or below the gate.", 1.0)
@@ -731,24 +1084,43 @@ def run_pipeline(
     n_kept = len(segments)
     n_dropped = len(onsets) - n_kept
 
+    use_clap = cluster_clap_mode in ("soft", "hard")
+    cluster_info = None  # set when CLAP types clusters for drum-kit placement
     if mode == "classify":
         report(f"Classifying {n_kept} segments…", 0.70)
-        classify_segments(segments, classifier_model)
-    elif mode == "hdbscan":
-        report(f"HDBSCAN on {n_kept} segments (min size {min_cluster_size})…", 0.70)
-        cluster_segments_hdbscan(segments, min_cluster_size)
-    elif mode == "auto":
-        report(f"Agglomerative on {n_kept} segments (threshold {threshold:.1f})…", 0.70)
-        cluster_segments_auto(segments, threshold)
+        classify_segments(segments, classifier_model, classifier_feature_type)
     else:
-        n_eff = max(1, min(n_clusters, n_kept))
-        report(f"KMeans on {n_kept} segments (k={n_eff})…", 0.70)
-        cluster_segments(segments, n_eff)
+        # Clustering. Optionally cluster in CLAP-embedding space (richer timbre
+        # grouping) instead of the 57-dim hand-crafted features.
+        clap_feats = None
+        if use_clap:
+            report(f"Embedding {n_kept} segments (CLAP)…", 0.62)
+            clap_feats = classify_feature_matrix(segments, "fused_clap")
+        space = "CLAP" if use_clap else "57-dim"
+        if mode == "hdbscan":
+            report(f"HDBSCAN on {n_kept} ({space}, min size {min_cluster_size})…", 0.70)
+            cluster_segments_hdbscan(segments, min_cluster_size, clap_feats)
+        elif mode == "auto":
+            report(f"Agglomerative on {n_kept} ({space}, threshold {threshold:.1f})…", 0.70)
+            cluster_segments_auto(segments, threshold, clap_feats)
+        else:
+            n_eff = max(1, min(n_clusters, n_kept))
+            report(f"KMeans on {n_kept} ({space}, k={n_eff})…", 0.70)
+            cluster_segments(segments, n_eff, clap_feats)
+        # With CLAP + a classifier, type each cluster and lay it on the drum kit
+        # (kick-like cluster → kick key, …) instead of generic cluster-per-key.
+        if use_clap and classifier_model is not None:
+            report("Typing clusters → drum kit…", 0.85)
+            cluster_info = cluster_consensus(segments, classifier_model, clap_feats)
 
     n_clusters_found = len({s.cluster for s in segments})
     report("Building instrument…", 0.90)
     if mode == "classify":
         instrument = build_instrument_drumkeys(segments, n_keys=n_keys)
+    elif cluster_info is not None and cluster_clap_mode == "hard":
+        instrument = build_instrument_drumkeys_hard(segments, cluster_info, n_keys=n_keys)
+    elif cluster_info is not None:  # soft
+        instrument = build_instrument_drumkeys_by_cluster(segments, n_keys=n_keys)
     else:
         instrument = build_instrument(segments, n_keys=n_keys)
     n_loaded = len(instrument.loaded_notes())

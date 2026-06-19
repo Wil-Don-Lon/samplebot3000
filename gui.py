@@ -330,6 +330,8 @@ class PipelineWorker(QObject):
         trim_threshold_db: float,
         noise_gate_db,
         classifier_model=None,
+        classifier_feature_type: str = "hand",
+        cluster_clap_mode: str = "off",
         clip_at_next_onset: bool = False,
     ) -> None:
         super().__init__()
@@ -343,6 +345,8 @@ class PipelineWorker(QObject):
         self._trim_threshold_db = trim_threshold_db
         self._noise_gate_db = noise_gate_db
         self._classifier_model = classifier_model
+        self._classifier_feature_type = classifier_feature_type
+        self._cluster_clap_mode = cluster_clap_mode
         self._clip_at_next_onset = clip_at_next_onset
 
     @Slot()
@@ -360,6 +364,8 @@ class PipelineWorker(QObject):
                 noise_gate_db=self._noise_gate_db,
                 n_keys=MAX_KEYS,
                 classifier_model=self._classifier_model,
+                classifier_feature_type=self._classifier_feature_type,
+                cluster_clap_mode=self._cluster_clap_mode,
                 clip_at_next_onset=self._clip_at_next_onset,
                 progress_callback=lambda msg, frac: self.progress.emit(msg, frac),
             )
@@ -400,6 +406,10 @@ class MainWindow(QMainWindow):
 
         # Per-key chosen sample (arrow-tab), selection, and step patterns.
         self._sample_choice: dict[int, int] = {}      # key -> chosen sample idx
+        # Velocity layers: when on, the velocity slider picks which stacked
+        # sample on a key fires (by loudness order), in both modes. When off,
+        # the arrow-tab choice fires. Works in classify and cluster modes.
+        self._velocity_layers: bool = False
         self._selected_key: Optional[int] = None
         self._patterns: dict[int, list[bool]] = {}    # key -> 16-step pattern
         # True while pushing a sample's settings into the controls, so the
@@ -560,6 +570,17 @@ class MainWindow(QMainWindow):
         col.addWidget(self.model_row)
         self.model_row.setVisible(False)
 
+        # CLAP placement (clustering only): Off = 57-dim cluster-per-key; Soft =
+        # cluster on CLAP, type each cluster, lay on the drum kit (same-type
+        # clusters may share keys); Hard = same but one cluster per key (no
+        # doubling). Soft/Hard need the trained clap model.
+        self.clap_combo = QComboBox()
+        self.clap_combo.addItem("Off", "off")
+        self.clap_combo.addItem("Soft", "soft")
+        self.clap_combo.addItem("Hard", "hard")
+        self.clap_row = self._labeled_row_widget("CLAP", self.clap_combo)
+        col.addWidget(self.clap_row)
+
         # Manual / Auto / HDBSCAN param (only one visible at a time)
         self.manual_row = self._make_manual_row()
         self.auto_row = self._make_auto_row()
@@ -674,7 +695,10 @@ class MainWindow(QMainWindow):
             self.model_combo.addItem(MODEL_LABELS.get(name, name), name)
         if self.model_combo.count() == 0:
             self.model_combo.addItem("(no models trained)", None)
-        idx = self.model_combo.findData("gb")   # default to best model
+        # Default to the best available model: CLAP+Pitch if trained, else gb.
+        idx = self.model_combo.findData("clap")
+        if idx < 0:
+            idx = self.model_combo.findData("gb")
         if idx >= 0:
             self.model_combo.setCurrentIndex(idx)
         return self.model_combo
@@ -773,6 +797,10 @@ class MainWindow(QMainWindow):
             lambda v: self.vel_value_lbl.setText(str(v))
         )
         self.vel_slider.valueChanged.connect(self._on_playback_control_changed)
+        # In velocity-layers mode the slider chooses the layer — keep the
+        # ◀ vel N/M ▶ readout in sync as it moves.
+        self.vel_slider.valueChanged.connect(
+            lambda _v: self._velocity_layers and self._update_sample_selector())
         col.addLayout(self._slider_row("VELOCITY", self.vel_slider, self.vel_value_lbl))
 
         # Loop while held
@@ -785,6 +813,17 @@ class MainWindow(QMainWindow):
         loop_row.addWidget(loop_label)
         loop_row.addWidget(self.loop_check, 1)
         col.addLayout(loop_row)
+
+        # Velocity layers: velocity slider picks which stacked sample fires
+        vlayer_row = QHBoxLayout()
+        vlayer_label = QLabel("VEL LAYERS")
+        vlayer_label.setObjectName("controlLabel")
+        vlayer_label.setMinimumWidth(110)
+        self.vlayer_check = ToggleSwitch()
+        self.vlayer_check.toggled.connect(self._on_vlayer_toggled)
+        vlayer_row.addWidget(vlayer_label)
+        vlayer_row.addWidget(self.vlayer_check, 1)
+        col.addLayout(vlayer_row)
 
         # Pitch sort: assign clusters to keys by dominant frequency
         sort_row = QHBoxLayout()
@@ -1002,23 +1041,26 @@ class MainWindow(QMainWindow):
         is_cluster = method == "cluster"
         self.btn_cluster.setChecked(is_cluster)
         self.btn_classify.setChecked(not is_cluster)
-        self.cluster_mode_row.setVisible(is_cluster)
-        self.model_row.setVisible(not is_cluster)
         # Pitch-sort only applies to clustering; classification uses a fixed
         # GM drum layout.
         self.sort_check.setEnabled(is_cluster)
-        self._update_cluster_param_rows()
+        self._update_control_visibility()
 
     @Slot()
     def _on_cluster_mode_changed(self) -> None:
-        self._update_cluster_param_rows()
+        self._update_control_visibility()
 
-    def _update_cluster_param_rows(self) -> None:
-        cluster = self._method == "cluster"
+    def _update_control_visibility(self) -> None:
+        """Show clustering sub-controls (MODE + param + CLAP) for clustering, and
+        the MODEL picker for classification."""
+        is_cluster = self._method == "cluster"
+        self.cluster_mode_row.setVisible(is_cluster)
+        self.clap_row.setVisible(is_cluster)
+        self.model_row.setVisible(not is_cluster)
         mode = self.cluster_mode_combo.currentData()
-        self.manual_row.setVisible(cluster and mode == "manual")
-        self.auto_row.setVisible(cluster and mode == "auto")
-        self.hdb_row.setVisible(cluster and mode == "hdbscan")
+        self.manual_row.setVisible(is_cluster and mode == "manual")
+        self.auto_row.setVisible(is_cluster and mode == "auto")
+        self.hdb_row.setVisible(is_cluster and mode == "hdbscan")
 
     def _classify_clusters(self) -> None:
         """Predict an instrument label per cluster via majority vote of its
@@ -1027,7 +1069,21 @@ class MainWindow(QMainWindow):
         self._cluster_conf = {}
         if self._model_bundle is None or not self._instrument.notes:
             return
+        feature_type = self._model_bundle.get("feature_type", "hand")
         pipe = self._model_bundle["pipeline"]
+        if feature_type != "hand":
+            # Embedding/ensemble models already labeled each segment in the
+            # pipeline (on the worker thread); reuse those — don't recompute on
+            # the UI thread (and `pipe` may be a list for the ensemble, with no
+            # .classes_). Confidence falls back to the per-key vote fraction.
+            for ci, segs in self._instrument.notes.items():
+                labels = [s.label for s in segs if getattr(s, "label", "")]
+                if not labels:
+                    continue
+                label, votes = Counter(labels).most_common(1)[0]
+                self._cluster_labels[int(ci)] = str(label)
+                self._cluster_conf[int(ci)] = votes / len(labels)
+            return
         has_proba = hasattr(pipe, "predict_proba")
         classes = list(pipe.classes_)
         for ci, segs in self._instrument.notes.items():
@@ -1063,6 +1119,9 @@ class MainWindow(QMainWindow):
         self.status.setText("starting…")
 
         classifier_model = None
+        classifier_feature_type = "hand"
+        cluster_clap_mode = self.clap_combo.currentData()  # off / soft / hard
+        cluster_use_clap = cluster_clap_mode != "off"
         if self._method == "classify":
             mode = "classify"
             model_name = self.model_combo.currentData()
@@ -1080,6 +1139,7 @@ class MainWindow(QMainWindow):
                     self._model_cache[model_name] = bundle
                 self._model_bundle = bundle
                 classifier_model = bundle["pipeline"]
+                classifier_feature_type = bundle.get("feature_type", "hand")
             except Exception as exc:  # noqa: BLE001
                 self.status.setText(f"could not load model '{model_name}': {exc}")
                 self.run_btn.setEnabled(True)
@@ -1088,7 +1148,27 @@ class MainWindow(QMainWindow):
         else:
             mode = self.cluster_mode_combo.currentData()  # manual / auto / hdbscan
             self._model_bundle = None  # clustering mode shows no labels
-        self._result_is_classify = (mode == "classify")
+            if cluster_use_clap:
+                # CLAP clustering types each cluster and lays it on the drum kit,
+                # so it needs the CLAP classifier. Load it automatically.
+                try:
+                    bundle = self._model_cache.get("clap")
+                    if bundle is None:
+                        bundle = load_bundle("clap")
+                        self._model_cache["clap"] = bundle
+                    self._model_bundle = bundle
+                    classifier_model = bundle["pipeline"]
+                    classifier_feature_type = bundle.get("feature_type", "hand")
+                except Exception as exc:  # noqa: BLE001
+                    self.status.setText(
+                        f"CLAP clustering needs the clap model "
+                        f"(python classifier.py --train --model clap): {exc}")
+                    self.run_btn.setEnabled(True)
+                    self.pick_btn.setEnabled(True)
+                    return
+        # Drum-kit layout when classifying, or when CLAP-clustering onto the kit.
+        self._result_is_classify = (mode == "classify") or (
+            self._method == "cluster" and cluster_use_clap)
 
         threshold = self._threshold_from_slider(self.thresh_slider.value())
         min_cluster_size = self._min_cluster_size_from_slider(self.mcs_slider.value())
@@ -1107,6 +1187,8 @@ class MainWindow(QMainWindow):
             trim_threshold_db=trim_threshold_db,
             noise_gate_db=noise_gate_db,
             classifier_model=classifier_model,
+            classifier_feature_type=classifier_feature_type,
+            cluster_clap_mode=cluster_clap_mode,
             clip_at_next_onset=self.clip_check.isChecked(),
         )
         self._worker.moveToThread(self._thread)
@@ -1200,6 +1282,14 @@ class MainWindow(QMainWindow):
     def _on_loop_toggled(self, checked: bool) -> None:
         self._store_controls_to_active()
 
+    @Slot(bool)
+    def _on_vlayer_toggled(self, checked: bool) -> None:
+        """Toggle velocity-layered sample selection. Refresh the arrow selector
+        so it reflects whether it still drives playback (it's disabled while
+        velocity layers are on)."""
+        self._velocity_layers = checked
+        self._update_sample_selector()
+
     # ---------- per-sample playback settings ----------
 
     def _active_segment(self):
@@ -1226,8 +1316,12 @@ class MainWindow(QMainWindow):
         seg = self._active_segment()
         if seg is None:
             return
+        # In velocity-layers mode the slider is the global hit velocity, so keep
+        # each sample's own stored velocity rather than stamping the slider on it.
+        velocity = (self._settings_for(seg).velocity if self._velocity_layers
+                    else self.vel_slider.value())
         seg.playback = PlaybackSettings(
-            velocity=self.vel_slider.value(),
+            velocity=velocity,
             loop=self.loop_check.isChecked(),
             a=self.a_slider.value(),
             d=self.d_slider.value(),
@@ -1240,7 +1334,10 @@ class MainWindow(QMainWindow):
         """Push a sample's settings into the controls without writing back."""
         self._loading_settings = True
         try:
-            self.vel_slider.setValue(st.velocity)
+            # In velocity-layers mode the slider is the global hit velocity, not
+            # a per-sample setting, so don't let key/sample selection clobber it.
+            if not self._velocity_layers:
+                self.vel_slider.setValue(st.velocity)
             self.loop_check.setChecked(st.loop)
             self.a_slider.setValue(st.a)
             self.d_slider.setValue(st.d)
@@ -1346,21 +1443,44 @@ class MainWindow(QMainWindow):
         self._select_key(cluster_idx, note_index)
         self._play_selected_sample(cluster_idx)
 
-    def _play_selected_sample(self, cluster_idx: int) -> None:
-        """Play the currently chosen sample on a key using that sample's own
-        playback settings (envelope, velocity, loop, filter)."""
+    def _velocity_layer_index(self, n: int) -> int:
+        """Map the velocity slider (1..127) to a stacked-sample index (0..n-1).
+        Segments are pre-sorted by loudness (rms), so soft→loud picks low→high."""
+        vel = self.vel_slider.value()
+        idx = int((vel - 1) / 126.0 * n)
+        return max(0, min(n - 1, idx))
+
+    def _play_selected_sample(self, cluster_idx: int,
+                              force_idx: Optional[int] = None) -> None:
+        """Play a sample on a key using that sample's own playback settings.
+
+        Sample choice:
+          - `force_idx` given  → play exactly that index (arrow auditioning).
+          - velocity layers on → the velocity slider picks the sample (by rms).
+          - otherwise          → the arrow-tab choice.
+        With velocity layers on, the slider velocity also drives gain/darkening,
+        so a harder "hit" both selects a louder layer and plays louder.
+        """
         segs = self._instrument.notes.get(cluster_idx)
         if not segs:
             return
-        idx = self._sample_choice.get(cluster_idx, 0) % len(segs)
+        if force_idx is not None:
+            idx = force_idx % len(segs)
+        elif self._velocity_layers and len(segs) > 1:
+            idx = self._velocity_layer_index(len(segs))
+        else:
+            idx = self._sample_choice.get(cluster_idx, 0) % len(segs)
         seg = segs[idx]
         st = self._settings_for(seg)
-        gain = st.velocity / 127.0
+        # In velocity-layers mode the live slider is the hit velocity; otherwise
+        # use the sample's stored velocity.
+        vel = self.vel_slider.value() if self._velocity_layers else st.velocity
+        gain = vel / 127.0
         adsr = (st.a * 0.01, st.d * 0.01, st.s / 100.0, st.r * 0.02)
         cutoff_hz = self._lpf_from_slider(st.lpf)
         # Velocity also applies the subtle darkening lowpass on top of the
         # per-sample filter.
-        audio = velocity_lowpass(seg.audio, st.velocity)
+        audio = velocity_lowpass(seg.audio, vel)
         self._engine.play(audio, gain=gain, note_id=cluster_idx,
                           adsr=adsr, cutoff_hz=cutoff_hz, loop=st.loop)
 
@@ -1383,7 +1503,9 @@ class MainWindow(QMainWindow):
         self.step_grid.setPattern(pattern)
 
     def _update_sample_selector(self) -> None:
-        """Refresh the ◀ N/M ▶ readout for the selected key."""
+        """Refresh the ◀ N/M ▶ readout for the selected key. With velocity layers
+        on, the slider (not the arrows) drives playback, so the arrows become an
+        auditioning aid and the readout shows the live velocity-selected layer."""
         key = self._selected_key
         segs = self._instrument.notes.get(key) if key is not None else None
         n = len(segs) if segs else 0
@@ -1393,8 +1515,12 @@ class MainWindow(QMainWindow):
         if not has:
             self.sample_lbl.setText("– / –")
             return
-        idx = self._sample_choice.get(key, 0) % n
-        self.sample_lbl.setText(f"{idx + 1} / {n}")
+        if self._velocity_layers and n > 1:
+            idx = self._velocity_layer_index(n)
+            self.sample_lbl.setText(f"vel {idx + 1} / {n}")
+        else:
+            idx = self._sample_choice.get(key, 0) % n
+            self.sample_lbl.setText(f"{idx + 1} / {n}")
 
     def _step_sample(self, delta: int) -> None:
         """Tab the chosen sample for the active key and audition it."""
@@ -1410,7 +1536,9 @@ class MainWindow(QMainWindow):
         seg = self._active_segment()
         if seg is not None:
             self._load_settings_into_controls(self._settings_for(seg))
-        self._play_selected_sample(key)   # audition the newly chosen sample
+        # Audition exactly the arrow-chosen sample, even if velocity layers are
+        # on (which would otherwise pick by velocity on a real key press).
+        self._play_selected_sample(key, force_idx=idx)
 
     @Slot(int)
     def _on_step_toggled(self, step: int) -> None:

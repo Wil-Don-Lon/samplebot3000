@@ -31,10 +31,13 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import load_audio, trim_silence, compute_features
+from pipeline import (
+    load_audio, features_from_oneshot, pitch_temporal_features, TARGET_SR,
+)
 
 ROOT = Path(__file__).resolve().parent / "training data"
 CACHE = Path(__file__).resolve().parent / "feature_cache.npz"
+FUSED_CACHE = Path(__file__).resolve().parent / "fused_feature_cache.npz"
 MODEL_DIR = Path(__file__).resolve().parent / "models"
 
 # Bins used as labels. Generic `toms` is intentionally excluded: most of its
@@ -47,8 +50,16 @@ AUDIO_EXTS = {".wav", ".aiff", ".aif", ".mp3", ".snd"}
 
 MODEL_NAMES = ["svm", "rf", "knn", "gb", "mlp"]
 
+# Embedding-based models: features are CLAP audio embedding ++ pitch/temporal
+# scalars (brief §2+§3), not the 57-dim hand-crafted vector. Their bundles carry
+# feature_type="fused_clap" so the pipeline re-embeds at inference.
+EMBED_MODEL_NAMES = ["clap"]
+ALL_MODEL_NAMES = EMBED_MODEL_NAMES + MODEL_NAMES  # CLAP first = preferred default
+
 # Human-readable names for the GUI picker.
 MODEL_LABELS = {
+    "ensemble": "Ensemble (vote)",
+    "clap": "CLAP+Pitch (GB)",
     "svm": "SVM (RBF)",
     "rf": "Random Forest",
     "knn": "k-NN",
@@ -57,33 +68,56 @@ MODEL_LABELS = {
 }
 
 
-def available_models() -> list[str]:
-    """Trained model names (in preference order) that have a saved .joblib."""
+def _trained_base_models() -> list[str]:
+    """Base model names (not the ensemble) that have a saved .joblib."""
     if not MODEL_DIR.exists():
         return []
-    return [n for n in MODEL_NAMES if (MODEL_DIR / f"{n}.joblib").exists()]
+    return [n for n in ALL_MODEL_NAMES if (MODEL_DIR / f"{n}.joblib").exists()]
+
+
+def available_models() -> list[str]:
+    """Selectable model names. Offers 'ensemble' when ≥2 base models exist so it
+    has something to vote across."""
+    base = _trained_base_models()
+    return (["ensemble"] + base) if len(base) >= 2 else base
 
 
 def load_bundle(name: str):
-    """Load a trained model bundle: {'pipeline': ..., 'labels': [...]}."""
+    """Load a model bundle: {'pipeline': ..., 'labels': [...], 'feature_type': ...}.
+
+    The 'ensemble' pseudo-model is assembled on the fly from every trained base
+    model; its 'pipeline' is the list of (pipeline, feature_type) members to vote.
+    """
     import joblib
+    if name == "ensemble":
+        members, labels = [], set()
+        for n in _trained_base_models():
+            b = joblib.load(MODEL_DIR / f"{n}.joblib")
+            members.append((b["pipeline"], b.get("feature_type", "hand")))
+            labels.update(b.get("labels", []))
+        return {"pipeline": members, "labels": sorted(labels),
+                "feature_type": "ensemble"}
     return joblib.load(MODEL_DIR / f"{name}.joblib")
 
 
 # -------- feature extraction --------
 
 def file_features(path: Path) -> np.ndarray | None:
-    """57-dim features for one one-shot sample (loaded, trimmed, analysed)."""
+    """57-dim features for one one-shot sample.
+
+    Routes through pipeline.features_from_oneshot so training featurizes each
+    one-shot exactly as the live pipeline featurizes an onset-aligned slice
+    (front-trim → 0.5s cap → tail-trim → peak-normalize → compute_features).
+    This is what keeps train-time and serve-time features identical.
+    """
     try:
         audio = load_audio(str(path))
     except Exception:
         return None
     if audio.size == 0:
         return None
-    audio = trim_silence(audio)
-    if audio.size < 256:
-        return None
-    return compute_features(audio)
+    result = features_from_oneshot(audio)
+    return None if result is None else result[1]
 
 
 def extract_all() -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -212,6 +246,71 @@ def cmd_compare() -> None:
         print(f"\nBest: {best[0]} ({best[1]:.3f})")
 
 
+def extract_fused_all() -> tuple[np.ndarray, np.ndarray]:
+    """Fused CLAP-embedding ++ pitch/temporal features over the training bins.
+
+    Each one-shot is reduced to its fixed-window slice (features_from_oneshot),
+    then CLAP-embedded (batched) and concatenated with the 5 pitch/temporal
+    scalars — the same representation embed_eval found best (macro-F1 0.75).
+    """
+    from embedders import get_embedder
+    emb = get_embedder("clap")
+    slices, y = [], []
+    for label in TRAIN_BINS:
+        d = ROOT / label
+        files = sorted(f for f in d.glob("*")
+                       if f.is_file() and f.suffix.lower() in AUDIO_EXTS)
+        ok = 0
+        for f in files:
+            try:
+                audio = load_audio(str(f))
+            except Exception:
+                continue
+            r = features_from_oneshot(audio)
+            if r is None:
+                continue
+            slices.append(r[0])
+            y.append(label)
+            ok += 1
+        print(f"  {label:7s} {ok:5d} samples")
+    print(f"Embedding {len(slices)} slices via CLAP (batched)…")
+    bs = 64
+    E = np.empty((len(slices), emb.dim), dtype=np.float32)
+    for i in range(0, len(slices), bs):
+        E[i:i + bs] = emb.embed_batch(slices[i:i + bs], TARGET_SR)
+    P = np.stack([pitch_temporal_features(a) for a in slices]).astype(np.float32)
+    return np.hstack([E, P]).astype(np.float32), np.asarray(y)
+
+
+def cmd_train_clap() -> None:
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report
+    import joblib
+
+    if FUSED_CACHE.exists():
+        d = np.load(FUSED_CACHE, allow_pickle=True)
+        X, y = d["X"], d["y"]
+    else:
+        print("Building fused feature cache…")
+        X, y = extract_fused_all()
+        np.savez_compressed(FUSED_CACHE, X=X, y=y)
+        print(f"Cached {len(y)} × {X.shape[1]} -> {FUSED_CACHE.name}")
+
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42)
+    pipe = make_model("gb")
+    print(f"Training CLAP+Pitch (gb) on {len(ytr)} samples…")
+    pipe.fit(Xtr, ytr)
+    print("\n=== clap — held-out test report ===")
+    print(classification_report(yte, pipe.predict(Xte), zero_division=0))
+
+    MODEL_DIR.mkdir(exist_ok=True)
+    joblib.dump(
+        {"pipeline": pipe, "labels": sorted(set(y)), "feature_type": "fused_clap"},
+        MODEL_DIR / "clap.joblib")
+    print("Saved -> models/clap.joblib")
+
+
 def cmd_predict(path: str, model: str) -> None:
     import joblib
 
@@ -242,7 +341,7 @@ def main() -> int:
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--compare", action="store_true")
     ap.add_argument("--predict", metavar="FILE")
-    ap.add_argument("--model", default="svm", choices=MODEL_NAMES)
+    ap.add_argument("--model", default="svm", choices=ALL_MODEL_NAMES)
     args = ap.parse_args()
 
     if args.extract:
@@ -252,7 +351,7 @@ def main() -> int:
     elif args.predict:
         cmd_predict(args.predict, args.model)
     elif args.train:
-        cmd_train(args.model)
+        cmd_train_clap() if args.model == "clap" else cmd_train(args.model)
     else:
         ap.print_help()
     return 0
