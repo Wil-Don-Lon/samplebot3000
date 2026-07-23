@@ -86,6 +86,21 @@ class PianoKeyboardWidget(QWidget):
         self.update()
         self.note_released.emit(note_index)
 
+    def show_pressed(self, note_index: int) -> None:
+        """Light a key as pressed WITHOUT emitting note_pressed — used for
+        external triggers (MIDI) that drive playback themselves."""
+        if note_index in self._pressed:
+            return
+        self._pressed.add(note_index)
+        self.update()
+
+    def show_released(self, note_index: int) -> None:
+        """Clear a key's pressed highlight without emitting note_released."""
+        if note_index not in self._pressed:
+            return
+        self._pressed.discard(note_index)
+        self.update()
+
     def set_loaded(self, note_indices: set[int]) -> None:
         self._loaded = set(note_indices)
         self.update()

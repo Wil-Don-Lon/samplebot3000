@@ -28,3 +28,9 @@ datasets/
 
 # Operational logs from the sample sorter (reference training-data ops)
 *_manifest_*.csv
+
+# Parked clutter (caches, build artifacts, OS junk) moved out of the way
+superfluous junk/
+
+# Saved kits (user data)
+kits/

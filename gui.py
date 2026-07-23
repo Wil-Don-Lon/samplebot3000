@@ -9,31 +9,35 @@ Layout: two columns of controls above a piano keyboard.
 from __future__ import annotations
 
 import math
-from collections import Counter
+import random
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QFileDialog, QSpinBox, QSlider, QProgressBar,
-    QFrame, QSizePolicy, QComboBox, QCheckBox, QButtonGroup, QScrollArea,
-    QApplication,
+    QLabel, QPushButton, QFileDialog, QSlider, QProgressBar,
+    QFrame, QSizePolicy, QButtonGroup, QScrollArea,
+    QApplication, QLineEdit, QDialog, QListWidget, QListWidgetItem,
 )
 
 from pipeline import (
-    run_pipeline, assign_keys_to_clusters, Instrument, NOTE_NAMES, MAX_KEYS,
-    KEY_CAP_LABEL,
+    run_pipeline, assign_keys_to_clusters, Instrument, NOTE_NAMES,
+    NOTE_NAMES_12, MAX_KEYS, KEY_CAP_LABEL,
 )
 from audio_engine import AudioEngine
 from piano_widget import PianoKeyboardWidget
-from cluster_viewer import ClusterViewerDialog
+from recategorize_dialog import RecategorizeDialog
 from adsr_widget import ADSREnvelopeWidget
-from classifier import available_models, load_bundle, MODEL_LABELS
 from moog_widgets import Knob, ToggleSwitch, LED, StepGrid
+import kit_store
+import logic_export
+from logic_export import BASE_MIDI_NOTE
+from midi_input import MidiListener
+from loudness import equal_loudness_gains
 
 try:
     from scipy.signal import butter, lfilter
@@ -57,8 +61,9 @@ class PlaybackSettings:
     a: int = 0            # 0..100  -> *0.01 s   attack
     d: int = 0            # 0..100  -> *0.01 s   decay
     s: int = 100          # 0..100  -> /100      sustain level
-    r: int = 5            # 0..100  -> *0.02 s   release
+    r: int = 100          # 0..100  -> *0.02 s   release (default fully maxed)
     lpf: int = 100        # 0..100  -> _lpf_from_slider -> Hz
+    volume: int = 100     # 0..100  -> /100      per-sample level trim (unity=100)
 
 
 def velocity_lowpass(audio: np.ndarray, velocity: int, sr: int = 44100) -> np.ndarray:
@@ -234,6 +239,32 @@ QSpinBox, QComboBox {
     min-width: 80px;
 }
 QSpinBox:hover, QComboBox:hover { border-color: #ff8a1e; }
+
+QLineEdit {
+    background-color: #17120c;
+    color: #f0e3cd;
+    border: 1px solid #4a3820;
+    padding: 5px 10px;
+    border-radius: 3px;
+    selection-background-color: #ff8a1e;
+    selection-color: #160f06;
+}
+QLineEdit:hover { border-color: #ff8a1e; }
+QLineEdit:focus { border-color: #ff8a1e; }
+
+QListWidget {
+    background-color: #17120c;
+    color: #f0e3cd;
+    border: 1px solid #4a3820;
+    border-radius: 3px;
+    outline: none;
+}
+QListWidget::item { padding: 6px 8px; }
+QListWidget::item:selected { background-color: #ff8a1e; color: #160f06; }
+/* Recategorize drag-and-drop list */
+QListWidget#recatList { background-color: #0f0b07; border: 1px solid #3a2c18; }
+QListWidget#recatList::item { padding: 4px 8px; }
+QListWidget#recatList::item:selected { background-color: #ff8a1e; color: #160f06; }
 QSpinBox::up-button, QSpinBox::down-button {
     background: transparent;
     border: none;
@@ -324,14 +355,12 @@ class PipelineWorker(QObject):
         mode: str,
         n_clusters: int,
         threshold: float,
-        min_cluster_size: int,
+        min_cluster_size: float,
         sensitivity: float,
         segment_length_s: float,
         trim_threshold_db: float,
         noise_gate_db,
-        classifier_model=None,
-        classifier_feature_type: str = "hand",
-        cluster_clap_mode: str = "off",
+        clap_sort: bool = False,
         clip_at_next_onset: bool = False,
     ) -> None:
         super().__init__()
@@ -344,9 +373,7 @@ class PipelineWorker(QObject):
         self._segment_length_s = segment_length_s
         self._trim_threshold_db = trim_threshold_db
         self._noise_gate_db = noise_gate_db
-        self._classifier_model = classifier_model
-        self._classifier_feature_type = classifier_feature_type
-        self._cluster_clap_mode = cluster_clap_mode
+        self._clap_sort = clap_sort
         self._clip_at_next_onset = clip_at_next_onset
 
     @Slot()
@@ -363,15 +390,94 @@ class PipelineWorker(QObject):
                 trim_threshold_db=self._trim_threshold_db,
                 noise_gate_db=self._noise_gate_db,
                 n_keys=MAX_KEYS,
-                classifier_model=self._classifier_model,
-                classifier_feature_type=self._classifier_feature_type,
-                cluster_clap_mode=self._cluster_clap_mode,
+                clap_sort=self._clap_sort,
                 clip_at_next_onset=self._clip_at_next_onset,
                 progress_callback=lambda msg, frac: self.progress.emit(msg, frac),
             )
             self.finished.emit(inst)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class KitBrowserDialog(QDialog):
+    """Pick a saved kit to load, or delete kits. `selected_path` is set on load."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Load Kit")
+        self.resize(420, 440)
+        self.selected_path = None
+        self._build_ui()
+        self._reload()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        header = QLabel("SAVED KITS")
+        header.setObjectName("dialogHeader")
+        root.addWidget(header)
+
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _i: self._on_load())
+        root.addWidget(self.list, 1)
+
+        self.empty_lbl = QLabel("(no kits saved yet)")
+        self.empty_lbl.setObjectName("dialogSubtle")
+        self.empty_lbl.setVisible(False)
+        root.addWidget(self.empty_lbl)
+
+        row = QHBoxLayout()
+        self.delete_btn = QPushButton("DELETE")
+        self.delete_btn.clicked.connect(self._on_delete)
+        row.addWidget(self.delete_btn)
+        row.addStretch(1)
+        cancel_btn = QPushButton("CANCEL")
+        cancel_btn.clicked.connect(self.reject)
+        self.load_btn = QPushButton("LOAD")
+        self.load_btn.clicked.connect(self._on_load)
+        row.addWidget(cancel_btn)
+        row.addWidget(self.load_btn)
+        root.addLayout(row)
+
+    def _reload(self) -> None:
+        self.list.clear()
+        kits = kit_store.list_kits()
+        for k in kits:
+            layout = "drum kit" if k["is_classify"] else "clustered"
+            item = QListWidgetItem(
+                f"{k['name']}   ·   {k['n_samples']} samples / {k['n_keys']} keys   ·   {layout}"
+            )
+            item.setData(Qt.UserRole, str(k["path"]))
+            self.list.addItem(item)
+        has = self.list.count() > 0
+        self.empty_lbl.setVisible(not has)
+        self.load_btn.setEnabled(has)
+        self.delete_btn.setEnabled(has)
+        if has:
+            self.list.setCurrentRow(0)
+
+    def _current_path(self):
+        item = self.list.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _on_load(self) -> None:
+        path = self._current_path()
+        if path is None:
+            return
+        self.selected_path = path
+        self.accept()
+
+    def _on_delete(self) -> None:
+        path = self._current_path()
+        if path is None:
+            return
+        try:
+            kit_store.delete_kit(path)
+        except OSError:
+            pass
+        self._reload()
 
 
 class MainWindow(QMainWindow):
@@ -396,20 +502,21 @@ class MainWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._worker: Optional[PipelineWorker] = None
 
-        # Method + supervised classification state.
-        self._method: str = "cluster"               # "cluster" | "classify"
-        self._result_is_classify: bool = False       # what the last run produced
-        self._model_bundle = None
-        self._model_cache: dict[str, object] = {}     # name -> loaded bundle
-        self._cluster_labels: dict[int, str] = {}    # cluster idx -> label
-        self._cluster_conf: dict[int, float] = {}     # cluster idx -> confidence
+        # True when the last run produced the fixed GM drum layout (CLAP-sort),
+        # which drives the drum-cap key labels and disables pitch-sort.
+        self._result_is_classify: bool = False
 
         # Per-key chosen sample (arrow-tab), selection, and step patterns.
         self._sample_choice: dict[int, int] = {}      # key -> chosen sample idx
-        # Velocity layers: when on, the velocity slider picks which stacked
-        # sample on a key fires (by loudness order), in both modes. When off,
-        # the arrow-tab choice fires. Works in classify and cluster modes.
-        self._velocity_layers: bool = False
+        # Sample-pick mode for keys holding several stacked samples:
+        #   "random"   → a random sample from the cluster fires on each hit.
+        #   "velocity" → the velocity slider picks the layer (soft→loud by rms).
+        self._sample_mode: str = "random"
+        # When False (default), envelope + filter edits apply to the whole cluster
+        # (every sample on the selected key); when True, only the active sample.
+        self._per_sample_edit: bool = False
+        # A-weighted equal-loudness normalization (off by default; opt-in).
+        self._equal_loudness: bool = False
         self._selected_key: Optional[int] = None
         self._patterns: dict[int, list[bool]] = {}    # key -> 16-step pattern
         # True while pushing a sample's settings into the controls, so the
@@ -422,6 +529,18 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._sync_adsr_to_engine()
         self._sync_lpf_to_engine()
+
+        # USB MIDI: play the clustered kit from a keyboard/pads. Optional and
+        # hot-pluggable — a 2s poll (re)connects the first device and detects
+        # unplug. MIDI note N triggers cluster N-BASE_MIDI_NOTE (same mapping as
+        # the Logic export), so playing here matches the exported kit.
+        self._midi = MidiListener()
+        self._midi.note_on.connect(self._on_midi_note_on)
+        self._midi.note_off.connect(self._on_midi_note_off)
+        self._midi_timer = QTimer(self)
+        self._midi_timer.timeout.connect(self._poll_midi)
+        self._midi_timer.start(2000)
+        self._poll_midi()
 
     # ============================================================
     # UI
@@ -458,12 +577,18 @@ class MainWindow(QMainWindow):
         header_row.addSpacing(12)
         header_row.addWidget(subtitle)
         header_row.addStretch(1)
+        self.midi_lbl = QLabel("MIDI: —")
+        self.midi_lbl.setObjectName("subtitle")
+        header_row.addWidget(self.midi_lbl)
         outer.addLayout(header_row)
 
         outer.addWidget(self._hline())
 
         # File / run row (full width above the two columns)
         outer.addLayout(self._build_top_row())
+
+        # Kit row: name + save/load/recategorize/export-to-Logic
+        outer.addLayout(self._build_kit_row())
 
         outer.addWidget(self._hline())
 
@@ -542,10 +667,40 @@ class MainWindow(QMainWindow):
         self.run_btn.clicked.connect(self._on_run)
         row.addWidget(self.run_btn)
 
-        self.view_btn = QPushButton("VIEW CLUSTERS")
-        self.view_btn.setEnabled(False)
-        self.view_btn.clicked.connect(self._on_view_clusters)
-        row.addWidget(self.view_btn)
+        return row
+
+    # ---------- kit row (save / load / recategorize / export) ----------
+
+    def _build_kit_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        kit_cap = QLabel("KIT")
+        kit_cap.setObjectName("sectionHeader")
+        row.addWidget(kit_cap)
+
+        self.kit_name_edit = QLineEdit()
+        self.kit_name_edit.setPlaceholderText("kit name")
+        self.kit_name_edit.setMaximumWidth(220)
+        row.addWidget(self.kit_name_edit, 1)
+
+        self.save_kit_btn = QPushButton("SAVE KIT")
+        self.save_kit_btn.clicked.connect(self._on_save_kit)
+        row.addWidget(self.save_kit_btn)
+
+        self.load_kit_btn = QPushButton("LOAD KIT")
+        self.load_kit_btn.clicked.connect(self._on_load_kit)
+        row.addWidget(self.load_kit_btn)
+
+        self.recat_btn = QPushButton("RECATEGORIZE")
+        self.recat_btn.setEnabled(False)
+        self.recat_btn.clicked.connect(self._on_recategorize)
+        row.addWidget(self.recat_btn)
+
+        self.export_btn = QPushButton("EXPORT → LOGIC")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._on_export_logic)
+        row.addWidget(self.export_btn)
 
         return row
 
@@ -557,45 +712,22 @@ class MainWindow(QMainWindow):
 
         col.addWidget(self._section_header("ANALYSIS"))
 
-        # Method toggle: clustering OR classification (mutually exclusive)
-        col.addWidget(self._make_method_toggle())
-
-        # Sub-control rows: cluster-mode combo (clustering) / model combo
-        # (classification). Only one is visible, driven by the toggle.
-        self.cluster_mode_row = self._labeled_row_widget(
-            "MODE", self._make_cluster_mode_combo())
-        self.model_row = self._labeled_row_widget(
-            "MODEL", self._make_model_combo())
-        col.addWidget(self.cluster_mode_row)
-        col.addWidget(self.model_row)
-        self.model_row.setVisible(False)
-
-        # CLAP placement (clustering only): Off = 57-dim cluster-per-key; Soft =
-        # cluster on CLAP, type each cluster, lay on the drum kit (same-type
-        # clusters may share keys); Hard = same but one cluster per key (no
-        # doubling). Soft/Hard need the trained clap model.
-        self.clap_combo = QComboBox()
-        self.clap_combo.addItem("Off", "off")
-        self.clap_combo.addItem("Soft", "soft")
-        self.clap_combo.addItem("Hard", "hard")
-        self.clap_row = self._labeled_row_widget("CLAP", self.clap_combo)
-        col.addWidget(self.clap_row)
-
-        # Manual / Auto / HDBSCAN param (only one visible at a time)
-        self.manual_row = self._make_manual_row()
-        self.auto_row = self._make_auto_row()
+        # HDBSCAN is the only clustering model now. KMeans (spheroid-constrained)
+        # and Agglomerative were dropped — audio features are too complex for
+        # those assumptions; HDBSCAN's density model is leagues better. Only its
+        # CLUSTER DIVERSITY knob remains.
         self.hdb_row = self._make_hdbscan_row()
-        col.addWidget(self.manual_row)
-        col.addWidget(self.auto_row)
         col.addWidget(self.hdb_row)
-        self.auto_row.setVisible(False)
-        self.hdb_row.setVisible(False)
 
         # Sample length (affects analysis — requires Run to apply)
+        # SAMPLE LEN sets the PLAYED/exported sample length only — clustering
+        # always sorts on a fixed short internal window (CLUSTER_FEATURE_LEN_S),
+        # so a long ring-out here never affects the (tuned) sorting. Default 4.0s
+        # + CLIP AT NEXT on = each hit rings out fully up to the next onset.
         self.length_slider = Knob()
         self.length_slider.setRange(1, 50)   # 0.1s .. 5.0s
-        self.length_slider.setValue(5)
-        self.length_value_lbl = QLabel("0.5 s")
+        self.length_slider.setValue(40)      # 4.0s playback cap
+        self.length_value_lbl = QLabel("4.0 s")
         self.length_value_lbl.setObjectName("valueLabel")
         self.length_value_lbl.setMinimumWidth(50)
         self.length_slider.valueChanged.connect(
@@ -623,29 +755,49 @@ class MainWindow(QMainWindow):
         # Trim threshold: silence-trim edges below this dBFS level
         self.trim_slider = Knob()
         self.trim_slider.setRange(0, 100)
-        self.trim_slider.setValue(40)
-        self.trim_value_lbl = QLabel("-38 dB")
+        self.trim_slider.setValue(33)        # -42 dB — tuned on the user's kit
+        self.trim_value_lbl = QLabel("-42 dB")
         self.trim_value_lbl.setObjectName("valueLabel")
         self.trim_value_lbl.setMinimumWidth(50)
         self.trim_slider.valueChanged.connect(self._on_trim_changed)
         col.addLayout(self._slider_row("TRIM THRESHOLD", self.trim_slider, self.trim_value_lbl))
 
-        # Clipper: when on, a sample ends at the next transient; when off it
-        # runs to the trim-threshold decay or the sample-length cap.
+        # Clipper: when on, a played sample ends at the next transient; when off
+        # it runs to the trim-threshold decay or the sample-length cap. Default ON
+        # so the (now-longer) playback window rings out fully up to the next hit
+        # instead of bleeding it into the tail.
         clip_row = QHBoxLayout()
         clip_lbl = QLabel("CLIP AT NEXT")
         clip_lbl.setObjectName("controlLabel")
         clip_lbl.setMinimumWidth(110)
-        self.clip_check = ToggleSwitch()
+        self.clip_check = ToggleSwitch(checked=True)
         clip_row.addWidget(clip_lbl)
         clip_row.addWidget(self.clip_check)
         clip_row.addStretch(1)
         col.addLayout(clip_row)
 
+        # CLAP-SORT (Stage 2): after clustering, label each cluster with CLAP +
+        # pitch/brightness cues and drop it on the matching drum key. Off = keep
+        # the raw pitch-ordered cluster-per-key layout. A toggle at the bottom of
+        # the analysis controls (was a dropdown up top).
+        clap_row = QHBoxLayout()
+        clap_lbl = QLabel("CLAP SORT")
+        clap_lbl.setObjectName("controlLabel")
+        clap_lbl.setMinimumWidth(110)
+        self.clap_check = ToggleSwitch()
+        clap_row.addWidget(clap_lbl)
+        clap_row.addWidget(self.clap_check)
+        clap_row.addStretch(1)
+        col.addLayout(clap_row)
+
         # Progress + status
         col.addWidget(self._progress_bar())
         self.status = QLabel("ready")
         self.status.setObjectName("statusLabel")
+        # Long status/summary text must wrap, not widen the window. Allow the
+        # label to shrink below its text's ideal width and grow vertically.
+        self.status.setWordWrap(True)
+        self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         col.addWidget(self.status)
 
         # 16-step sequencer grid (select a key, then light up its steps).
@@ -659,84 +811,28 @@ class MainWindow(QMainWindow):
         col.addStretch(1)
         return col
 
-    def _make_method_toggle(self) -> QWidget:
+    def _make_sample_mode_toggle(self) -> QWidget:
+        """Segmented RANDOM | VEL LAYER switch for per-hit sample selection."""
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
-        self.btn_cluster = QPushButton("CLUSTERING")
-        self.btn_cluster.setObjectName("toggleLeft")
-        self.btn_cluster.setCheckable(True)
-        self.btn_cluster.setChecked(True)
-        self.btn_classify = QPushButton("CLASSIFICATION")
-        self.btn_classify.setObjectName("toggleRight")
-        self.btn_classify.setCheckable(True)
+        self.btn_random = QPushButton("RANDOM")
+        self.btn_random.setObjectName("toggleLeft")
+        self.btn_random.setCheckable(True)
+        self.btn_random.setChecked(self._sample_mode == "random")
+        self.btn_vellayer = QPushButton("VEL LAYER")
+        self.btn_vellayer.setObjectName("toggleRight")
+        self.btn_vellayer.setCheckable(True)
+        self.btn_vellayer.setChecked(self._sample_mode == "velocity")
         grp = QButtonGroup(w)
         grp.setExclusive(True)
-        grp.addButton(self.btn_cluster)
-        grp.addButton(self.btn_classify)
-        self.btn_cluster.clicked.connect(lambda: self._set_method("cluster"))
-        self.btn_classify.clicked.connect(lambda: self._set_method("classify"))
-        h.addWidget(self.btn_cluster, 1)
-        h.addWidget(self.btn_classify, 1)
-        return w
-
-    def _make_cluster_mode_combo(self) -> QWidget:
-        self.cluster_mode_combo = QComboBox()
-        self.cluster_mode_combo.addItem("KMeans (manual k)", "manual")
-        self.cluster_mode_combo.addItem("Agglomerative", "auto")
-        self.cluster_mode_combo.addItem("HDBSCAN", "hdbscan")
-        self.cluster_mode_combo.currentIndexChanged.connect(self._on_cluster_mode_changed)
-        return self.cluster_mode_combo
-
-    def _make_model_combo(self) -> QWidget:
-        self.model_combo = QComboBox()
-        for name in available_models():
-            self.model_combo.addItem(MODEL_LABELS.get(name, name), name)
-        if self.model_combo.count() == 0:
-            self.model_combo.addItem("(no models trained)", None)
-        # Default to the best available model: CLAP+Pitch if trained, else gb.
-        idx = self.model_combo.findData("clap")
-        if idx < 0:
-            idx = self.model_combo.findData("gb")
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
-        return self.model_combo
-
-    def _make_manual_row(self) -> QWidget:
-        w = QWidget()
-        row = QHBoxLayout(w)
-        row.setContentsMargins(0, 0, 0, 0)
-        label = QLabel("COUNT")
-        label.setObjectName("controlLabel")
-        label.setMinimumWidth(110)
-        row.addWidget(label)
-        self.cluster_spin = QSpinBox()
-        self.cluster_spin.setRange(2, MAX_KEYS)
-        self.cluster_spin.setValue(8)
-        row.addWidget(self.cluster_spin)
-        row.addStretch(1)
-        return w
-
-    def _make_auto_row(self) -> QWidget:
-        w = QWidget()
-        row = QHBoxLayout(w)
-        row.setContentsMargins(0, 0, 0, 0)
-        label = QLabel("CLUSTER DIVERSITY")
-        label.setObjectName("controlLabel")
-        label.setMinimumWidth(130)
-        row.addWidget(label)
-        self.thresh_slider = QSlider(Qt.Horizontal)
-        self.thresh_slider.setRange(0, 100)
-        self.thresh_slider.setValue(50)
-        self.thresh_value_lbl = QLabel("50")
-        self.thresh_value_lbl.setObjectName("valueLabel")
-        self.thresh_value_lbl.setMinimumWidth(50)
-        self.thresh_slider.valueChanged.connect(
-            lambda v: self.thresh_value_lbl.setText(str(v))
-        )
-        row.addWidget(self.thresh_slider, 1)
-        row.addWidget(self.thresh_value_lbl)
+        grp.addButton(self.btn_random)
+        grp.addButton(self.btn_vellayer)
+        self.btn_random.clicked.connect(lambda: self._set_sample_mode("random"))
+        self.btn_vellayer.clicked.connect(lambda: self._set_sample_mode("velocity"))
+        h.addWidget(self.btn_random, 1)
+        h.addWidget(self.btn_vellayer, 1)
         return w
 
     def _make_hdbscan_row(self) -> QWidget:
@@ -747,14 +843,18 @@ class MainWindow(QMainWindow):
         label.setObjectName("controlLabel")
         label.setMinimumWidth(130)
         row.addWidget(label)
+        # Decimal diversity: slider units are tenths (20..150 = 2.0..15.0). The
+        # value is min_cluster_size; the fractional part becomes a small
+        # cluster-merge epsilon downstream. Default 4.0 was tuned (grid search
+        # over the user's kit) to best reproduce their hand-drawn per-drum slices.
         self.mcs_slider = QSlider(Qt.Horizontal)
-        self.mcs_slider.setRange(0, 100)
-        self.mcs_slider.setValue(50)
-        self.mcs_value_lbl = QLabel("50")
+        self.mcs_slider.setRange(20, 150)
+        self.mcs_slider.setValue(40)   # 4.0 — tuned to reproduce the user's slices
+        self.mcs_value_lbl = QLabel("4.0")
         self.mcs_value_lbl.setObjectName("valueLabel")
         self.mcs_value_lbl.setMinimumWidth(50)
         self.mcs_slider.valueChanged.connect(
-            lambda v: self.mcs_value_lbl.setText(str(v))
+            lambda v: self.mcs_value_lbl.setText(f"{v/10:.1f}")
         )
         row.addWidget(self.mcs_slider, 1)
         row.addWidget(self.mcs_value_lbl)
@@ -763,8 +863,8 @@ class MainWindow(QMainWindow):
     def _make_sens_slider(self) -> QWidget:
         self.sens_slider = Knob()
         self.sens_slider.setRange(0, 100)
-        self.sens_slider.setValue(50)
-        self.sens_value_lbl = QLabel("0.50")
+        self.sens_slider.setValue(35)        # 0.35 — tuned on the user's kit
+        self.sens_value_lbl = QLabel("0.35")
         self.sens_value_lbl.setObjectName("valueLabel")
         self.sens_value_lbl.setMinimumWidth(50)
         self.sens_slider.valueChanged.connect(
@@ -797,11 +897,26 @@ class MainWindow(QMainWindow):
             lambda v: self.vel_value_lbl.setText(str(v))
         )
         self.vel_slider.valueChanged.connect(self._on_playback_control_changed)
-        # In velocity-layers mode the slider chooses the layer — keep the
+        # In VEL LAYER mode the slider chooses the layer — keep the
         # ◀ vel N/M ▶ readout in sync as it moves.
         self.vel_slider.valueChanged.connect(
-            lambda _v: self._velocity_layers and self._update_sample_selector())
+            lambda _v: self._sample_mode == "velocity" and self._update_sample_selector())
         col.addLayout(self._slider_row("VELOCITY", self.vel_slider, self.vel_value_lbl))
+
+        # Per-sample VOLUME: a stored level trim on the sample(s), separate from
+        # the live VELOCITY hit gain. Like ENVELOPE/FILTER it's governed by the
+        # PER-SAMPLE EDIT toggle (whole cluster by default, active sample when on).
+        self.volume_slider = Knob()
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(100)
+        self.volume_value_lbl = QLabel("100%")
+        self.volume_value_lbl.setObjectName("valueLabel")
+        self.volume_value_lbl.setMinimumWidth(50)
+        self.volume_slider.valueChanged.connect(
+            lambda v: self.volume_value_lbl.setText(f"{v}%")
+        )
+        self.volume_slider.valueChanged.connect(self._on_playback_control_changed)
+        col.addLayout(self._slider_row("VOLUME", self.volume_slider, self.volume_value_lbl))
 
         # Loop while held
         loop_row = QHBoxLayout()
@@ -814,16 +929,16 @@ class MainWindow(QMainWindow):
         loop_row.addWidget(self.loop_check, 1)
         col.addLayout(loop_row)
 
-        # Velocity layers: velocity slider picks which stacked sample fires
-        vlayer_row = QHBoxLayout()
-        vlayer_label = QLabel("VEL LAYERS")
-        vlayer_label.setObjectName("controlLabel")
-        vlayer_label.setMinimumWidth(110)
-        self.vlayer_check = ToggleSwitch()
-        self.vlayer_check.toggled.connect(self._on_vlayer_toggled)
-        vlayer_row.addWidget(vlayer_label)
-        vlayer_row.addWidget(self.vlayer_check, 1)
-        col.addLayout(vlayer_row)
+        # Sample pick: how a key with several stacked samples chooses which one
+        # fires on each hit. RANDOM = a random sample from the cluster every hit;
+        # VEL LAYER = the velocity slider selects the layer (soft→loud).
+        smode_row = QHBoxLayout()
+        smode_label = QLabel("SAMPLE PICK")
+        smode_label.setObjectName("controlLabel")
+        smode_label.setMinimumWidth(110)
+        smode_row.addWidget(smode_label)
+        smode_row.addWidget(self._make_sample_mode_toggle(), 1)
+        col.addLayout(smode_row)
 
         # Pitch sort: assign clusters to keys by dominant frequency
         sort_row = QHBoxLayout()
@@ -835,6 +950,32 @@ class MainWindow(QMainWindow):
         sort_row.addWidget(sort_label)
         sort_row.addWidget(self.sort_check, 1)
         col.addLayout(sort_row)
+
+        # Equal loudness: A-weighted (Fletcher-Munson) perceived-loudness
+        # normalization — tames bright/harsh samples so the whole kit sits at
+        # even perceived loudness. Applies to playback AND the Logic export.
+        eqloud_row = QHBoxLayout()
+        eqloud_label = QLabel("EQUAL LOUDNESS")
+        eqloud_label.setObjectName("controlLabel")
+        eqloud_label.setMinimumWidth(110)
+        self.eqloud_check = ToggleSwitch()
+        self.eqloud_check.toggled.connect(self._on_equal_loudness_toggled)
+        eqloud_row.addWidget(eqloud_label)
+        eqloud_row.addWidget(self.eqloud_check, 1)
+        col.addLayout(eqloud_row)
+
+        # Per-sample edit: by default, volume + envelope + filter edits apply to
+        # the WHOLE cluster (every sample on the selected key). Flip this on to
+        # sculpt just the active sample instead.
+        psedit_row = QHBoxLayout()
+        psedit_label = QLabel("PER-SAMPLE EDIT")
+        psedit_label.setObjectName("controlLabel")
+        psedit_label.setMinimumWidth(110)
+        self.psedit_check = ToggleSwitch()
+        self.psedit_check.toggled.connect(self._on_per_sample_edit_toggled)
+        psedit_row.addWidget(psedit_label)
+        psedit_row.addWidget(self.psedit_check, 1)
+        col.addLayout(psedit_row)
 
         # ADSR section
         col.addSpacing(4)
@@ -871,9 +1012,10 @@ class MainWindow(QMainWindow):
         self.s_slider, self.s_lbl = make_adsr_slider(
             100, lambda v: f"{v/100:.2f}"
         )
-        # Release: 0..2000ms linear
+        # Release: 0..2000ms linear. Default fully maxed (2000 ms) so samples
+        # ring out by default rather than being cut short.
         self.r_slider, self.r_lbl = make_adsr_slider(
-            5, lambda v: f"{int(v * 20)} ms"
+            100, lambda v: f"{int(v * 20)} ms"
         )
 
         for row_idx, (name, sl, lb) in enumerate([
@@ -982,17 +1124,6 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     @staticmethod
-    def _threshold_from_slider(v: int) -> float:
-        # Cluster Diversity: high slider = high threshold = few broad clusters
-        return 1.0 + 14.0 * (v / 100.0)
-
-    @staticmethod
-    def _min_cluster_size_from_slider(v: int) -> int:
-        # Cluster Diversity: high slider = larger min size = fewer, broader clusters.
-        # Range 2..30; the pipeline caps this at half the dataset size at runtime.
-        return max(2, int(round(2 + 28 * (v / 100.0))))
-
-    @staticmethod
     def _volume_gate_db_from_slider(v: int):
         """Slider 0 = OFF (None); 1..100 maps to -60..-6 dB."""
         if v <= 0:
@@ -1036,142 +1167,28 @@ class MainWindow(QMainWindow):
         self.file_label.setText(Path(path).name)
         self.run_btn.setEnabled(True)
 
-    def _set_method(self, method: str) -> None:
-        self._method = method
-        is_cluster = method == "cluster"
-        self.btn_cluster.setChecked(is_cluster)
-        self.btn_classify.setChecked(not is_cluster)
-        # Pitch-sort only applies to clustering; classification uses a fixed
-        # GM drum layout.
-        self.sort_check.setEnabled(is_cluster)
-        self._update_control_visibility()
-
-    @Slot()
-    def _on_cluster_mode_changed(self) -> None:
-        self._update_control_visibility()
-
-    def _update_control_visibility(self) -> None:
-        """Show clustering sub-controls (MODE + param + CLAP) for clustering, and
-        the MODEL picker for classification."""
-        is_cluster = self._method == "cluster"
-        self.cluster_mode_row.setVisible(is_cluster)
-        self.clap_row.setVisible(is_cluster)
-        self.model_row.setVisible(not is_cluster)
-        mode = self.cluster_mode_combo.currentData()
-        self.manual_row.setVisible(is_cluster and mode == "manual")
-        self.auto_row.setVisible(is_cluster and mode == "auto")
-        self.hdb_row.setVisible(is_cluster and mode == "hdbscan")
-
-    def _classify_clusters(self) -> None:
-        """Predict an instrument label per cluster via majority vote of its
-        segments. No re-extraction — segments already carry their features."""
-        self._cluster_labels = {}
-        self._cluster_conf = {}
-        if self._model_bundle is None or not self._instrument.notes:
-            return
-        feature_type = self._model_bundle.get("feature_type", "hand")
-        pipe = self._model_bundle["pipeline"]
-        if feature_type != "hand":
-            # Embedding/ensemble models already labeled each segment in the
-            # pipeline (on the worker thread); reuse those — don't recompute on
-            # the UI thread (and `pipe` may be a list for the ensemble, with no
-            # .classes_). Confidence falls back to the per-key vote fraction.
-            for ci, segs in self._instrument.notes.items():
-                labels = [s.label for s in segs if getattr(s, "label", "")]
-                if not labels:
-                    continue
-                label, votes = Counter(labels).most_common(1)[0]
-                self._cluster_labels[int(ci)] = str(label)
-                self._cluster_conf[int(ci)] = votes / len(labels)
-            return
-        has_proba = hasattr(pipe, "predict_proba")
-        classes = list(pipe.classes_)
-        for ci, segs in self._instrument.notes.items():
-            feats = [s.features for s in segs if getattr(s, "features", None) is not None]
-            if not feats:
-                continue
-            X = np.stack(feats).astype(np.float32)
-            preds = pipe.predict(X)
-            label, votes = Counter(preds).most_common(1)[0]
-            if has_proba:
-                proba = pipe.predict_proba(X)
-                conf = float(proba[:, classes.index(label)].mean())
-            else:
-                conf = votes / len(preds)
-            self._cluster_labels[int(ci)] = str(label)
-            self._cluster_conf[int(ci)] = conf
-
-    def _label_summary(self) -> str:
-        if not self._cluster_labels:
-            return ""
-        counts = Counter(self._cluster_labels.values())
-        parts = [f"{n}×{lab}" for lab, n in counts.most_common()]
-        return "classified: " + ", ".join(parts)
-
     @Slot()
     def _on_run(self) -> None:
         if not self._audio_path:
             return
         self.run_btn.setEnabled(False)
         self.pick_btn.setEnabled(False)
-        self.view_btn.setEnabled(False)
+        self._enable_instrument_actions(False)
         self.progress_bar.setValue(0)
         self.status.setText("starting…")
 
-        classifier_model = None
-        classifier_feature_type = "hand"
-        cluster_clap_mode = self.clap_combo.currentData()  # off / soft / hard
-        cluster_use_clap = cluster_clap_mode != "off"
-        if self._method == "classify":
-            mode = "classify"
-            model_name = self.model_combo.currentData()
-            if model_name is None:
-                self.status.setText("no trained model — run classifier.py --train first.")
-                self.run_btn.setEnabled(True)
-                self.pick_btn.setEnabled(True)
-                return
-            try:
-                bundle = self._model_cache.get(model_name)
-                if bundle is None:
-                    bundle = load_bundle(model_name)
-                    if not isinstance(bundle, dict) or "pipeline" not in bundle:
-                        raise ValueError("bundle missing 'pipeline'")
-                    self._model_cache[model_name] = bundle
-                self._model_bundle = bundle
-                classifier_model = bundle["pipeline"]
-                classifier_feature_type = bundle.get("feature_type", "hand")
-            except Exception as exc:  # noqa: BLE001
-                self.status.setText(f"could not load model '{model_name}': {exc}")
-                self.run_btn.setEnabled(True)
-                self.pick_btn.setEnabled(True)
-                return
-        else:
-            mode = self.cluster_mode_combo.currentData()  # manual / auto / hdbscan
-            self._model_bundle = None  # clustering mode shows no labels
-            if cluster_use_clap:
-                # CLAP clustering types each cluster and lays it on the drum kit,
-                # so it needs the CLAP classifier. Load it automatically.
-                try:
-                    bundle = self._model_cache.get("clap")
-                    if bundle is None:
-                        bundle = load_bundle("clap")
-                        self._model_cache["clap"] = bundle
-                    self._model_bundle = bundle
-                    classifier_model = bundle["pipeline"]
-                    classifier_feature_type = bundle.get("feature_type", "hand")
-                except Exception as exc:  # noqa: BLE001
-                    self.status.setText(
-                        f"CLAP clustering needs the clap model "
-                        f"(python classifier.py --train --model clap): {exc}")
-                    self.run_btn.setEnabled(True)
-                    self.pick_btn.setEnabled(True)
-                    return
-        # Drum-kit layout when classifying, or when CLAP-clustering onto the kit.
-        self._result_is_classify = (mode == "classify") or (
-            self._method == "cluster" and cluster_use_clap)
+        # Cluster-first flow only. Stage 1 = HDBSCAN clustering; Stage 2 =
+        # optional CLAP-sort of the finished clusters onto drum keys.
+        mode = "hdbscan"   # the only clustering model
+        clap_sort = self.clap_check.isChecked()
+        # CLAP-sorted results use the fixed GM drum layout, which PITCH SORT never
+        # re-sorts, so disable that control there.
+        self._result_is_classify = clap_sort
+        self.sort_check.setEnabled(not clap_sort)
 
-        threshold = self._threshold_from_slider(self.thresh_slider.value())
-        min_cluster_size = self._min_cluster_size_from_slider(self.mcs_slider.value())
+        # HDBSCAN diversity is a float (tenths): int part = min_cluster_size,
+        # fractional part feeds a small merge epsilon downstream.
+        min_cluster_size = self.mcs_slider.value() / 10.0
         noise_gate_db = self._volume_gate_db_from_slider(self.gate_slider.value())
         trim_threshold_db = self._trim_db_from_slider(self.trim_slider.value())
 
@@ -1179,16 +1196,14 @@ class MainWindow(QMainWindow):
         self._worker = PipelineWorker(
             self._audio_path,
             mode=mode,
-            n_clusters=self.cluster_spin.value(),
-            threshold=threshold,
+            n_clusters=8,        # unused by HDBSCAN; only its KMeans fallback
+            threshold=5.0,       # unused by HDBSCAN
             min_cluster_size=min_cluster_size,
             sensitivity=self.sens_slider.value() / 100.0,
             segment_length_s=self.length_slider.value() / 10.0,
             trim_threshold_db=trim_threshold_db,
             noise_gate_db=noise_gate_db,
-            classifier_model=classifier_model,
-            classifier_feature_type=classifier_feature_type,
-            cluster_clap_mode=cluster_clap_mode,
+            clap_sort=clap_sort,
             clip_at_next_onset=self.clip_check.isChecked(),
         )
         self._worker.moveToThread(self._thread)
@@ -1210,8 +1225,12 @@ class MainWindow(QMainWindow):
     def _on_finished(self, instrument: object) -> None:
         assert isinstance(instrument, Instrument)
         self._instrument = instrument
-        # Flat segment list for re-assigning keys on pitch-sort toggle.
-        self._all_segments = [s for segs in instrument.notes.values() for s in segs]
+        # Flat segment list for re-assigning keys on pitch-sort toggle. Includes
+        # the unassigned outliers so a re-sort re-buckets (not loses) them.
+        self._all_segments = (
+            [s for segs in instrument.notes.values() for s in segs]
+            + list(instrument.unassigned))
+        self._apply_loudness_gains()
         loaded = instrument.loaded_notes()
         self._octave = 0
         # Fresh instrument → reset sample choice, selection, and step patterns.
@@ -1224,15 +1243,14 @@ class MainWindow(QMainWindow):
         self._update_sample_selector()
         self.step_grid.setActive(False)
         self.step_grid.setPattern([False] * N_STEPS)
-        self._classify_clusters()
         self._refresh_octave_view()
         if loaded:
-            self.view_btn.setEnabled(True)
-            summary = self._label_summary()
-            if summary:
-                self.status.setText(self.status.text() + "  ·  " + summary)
+            self._enable_instrument_actions(True)
+        elif instrument.unassigned:
+            # No keys, but outliers to triage — allow recategorize to place them.
+            self._enable_instrument_actions(True)
         else:
-            self.view_btn.setEnabled(False)
+            self._enable_instrument_actions(False)
             self.status.setText("0 keys loaded — try raising sensitivity or lowering threshold.")
 
     @Slot(str)
@@ -1245,7 +1263,7 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self.pick_btn.setEnabled(True)
         if self._instrument.loaded_notes():
-            self.view_btn.setEnabled(True)
+            self._enable_instrument_actions(True)
         if self._worker is not None:
             self._worker.deleteLater()
             self._worker = None
@@ -1253,16 +1271,159 @@ class MainWindow(QMainWindow):
             self._thread.deleteLater()
             self._thread = None
 
+    # ============================================================
+    # kit: save / load / recategorize / export to Logic
+    # ============================================================
+
+    def _current_key_label(self, key: int) -> str:
+        """Human label for a key: drum cap (KICK/SNR1/…) in drum-layout mode,
+        else the note name with octave offset."""
+        if self._result_is_classify:
+            return KEY_CAP_LABEL.get(key, f"KEY {key}")
+        note = NOTE_NAMES_12[key % 12]
+        octave = key // 12
+        return f"{note}+{octave}" if octave else note
+
+    def _enable_instrument_actions(self, enabled: bool) -> None:
+        self.recat_btn.setEnabled(enabled)
+        self.export_btn.setEnabled(enabled)
+
+    def _refresh_after_instrument_change(self, status_text: str) -> None:
+        """Shared reset + redraw after the instrument's key mapping changes
+        (kit load or recategorize). Releases held notes, clears per-key state,
+        rebuilds labels, and repaints the octave view."""
+        for n in list(self.piano._pressed):  # type: ignore[attr-defined]
+            cluster_idx = n + self._octave * OCTAVE_STEP
+            self._engine.release_note(cluster_idx)
+            self.piano.release_note(n)
+        self._all_segments = (
+            [s for segs in self._instrument.notes.values() for s in segs]
+            + list(self._instrument.unassigned))
+        self._apply_loudness_gains()
+        self._octave = 0
+        self._sample_choice = {}
+        self._selected_key = None
+        self._patterns = {}
+        self.piano.set_selected(None)
+        self.active_led.setOn(False)
+        self.active_lbl.setText("—")
+        self._update_sample_selector()
+        self.step_grid.setActive(False)
+        self.step_grid.setPattern([False] * N_STEPS)
+        self.sort_check.setEnabled(not self._result_is_classify)
+        self._refresh_octave_view()
+        loaded = bool(self._instrument.loaded_notes())
+        self._enable_instrument_actions(loaded)
+        self.status.setText(status_text)
+
     @Slot()
-    def _on_view_clusters(self) -> None:
-        dlg = ClusterViewerDialog(
+    def _on_save_kit(self) -> None:
+        name = self.kit_name_edit.text().strip()
+        if not name:
+            self.status.setText("enter a kit name before saving.")
+            return
+        if not self._instrument.loaded_notes():
+            self.status.setText("nothing to save — run an analysis or load a kit first.")
+            return
+        try:
+            kit_store.save_kit(
+                name, self._instrument, self._result_is_classify,
+                sample_choice=self._sample_choice,
+                key_label=self._current_key_label,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"save failed: {exc}")
+            return
+        n = sum(len(v) for v in self._instrument.notes.values())
+        self.status.setText(f"saved kit '{name}'  ·  {n} samples")
+
+    @Slot()
+    def _on_load_kit(self) -> None:
+        dlg = KitBrowserDialog(self)
+        if dlg.exec() != QDialog.Accepted or dlg.selected_path is None:
+            return
+        path = dlg.selected_path
+        try:
+            instrument, is_classify = kit_store.load_kit(
+                path, playback_factory=PlaybackSettings)
+            sample_choice = kit_store.load_sample_choice(path)
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"load failed: {exc}")
+            return
+        self._instrument = instrument
+        self._result_is_classify = is_classify
+        kit_display_name = Path(path).name
+        self.kit_name_edit.setText(kit_display_name)
+        self._refresh_after_instrument_change(f"loaded kit '{kit_display_name}'")
+        # Restore the arrow-tab sample choice after the reset.
+        self._sample_choice = sample_choice
+
+    @Slot()
+    def _on_recategorize(self) -> None:
+        if not self._instrument.loaded_notes() and not self._instrument.unassigned:
+            self.status.setText("nothing to recategorize — run an analysis or load a kit first.")
+            return
+        dlg = RecategorizeDialog(
             self._instrument, self._engine,
             get_gain=lambda: self.vel_slider.value() / 127.0,
-            labels=self._cluster_labels,
-            confidences=self._cluster_conf,
+            is_classify=self._result_is_classify,
+            key_label=self._current_key_label,
             parent=self,
         )
-        dlg.exec()
+        if dlg.exec() != QDialog.Accepted or dlg.new_notes is None:
+            return
+        self._instrument.notes = dlg.new_notes
+        self._instrument.unassigned = dlg.new_unassigned
+        n_keys = len(self._instrument.loaded_notes())
+        n_un = len(self._instrument.unassigned)
+        extra = f"  ·  {n_un} unassigned" if n_un else ""
+        self._refresh_after_instrument_change(
+            f"recategorized  ·  {n_keys} keys{extra}")
+
+    @Slot()
+    def _on_export_logic(self) -> None:
+        if not self._instrument.loaded_notes():
+            self.status.setText("nothing to export — run an analysis or load a kit first.")
+            return
+        name = self.kit_name_edit.text().strip() or "Samplebot Kit"
+        # Default to Logic's user Sampler Instruments folder (create it if the
+        # audio-apps root exists), but let the user redirect anywhere.
+        start_dir = logic_export.LOGIC_SAMPLER_INSTRUMENTS
+        try:
+            if start_dir.parent.exists():
+                start_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        if not start_dir.exists():
+            start_dir = Path.home()
+        dest = QFileDialog.getExistingDirectory(
+            self, "Export kit to…", str(start_dir))
+        if not dest:
+            return
+        # Mirror the app's SAMPLE PICK mode into the Logic layout: RANDOM →
+        # round-robin groups (a different sample each hit); VEL LAYER → velocity
+        # split. Single-sample keys are identical either way.
+        round_robin = self._sample_mode == "random"
+        # Bake the equal-loudness gain into the exported WAVs when it's on, so the
+        # Logic kit sounds balanced like the app does.
+        gain_for = ((lambda s: getattr(s, "loudness_gain", 1.0))
+                    if self._equal_loudness else None)
+        try:
+            zones = logic_export.instrument_to_zonespecs(
+                self._instrument.notes, key_label=self._current_key_label,
+                round_robin=round_robin, gain_for=gain_for)
+            exs_path = logic_export.write_exs_kit(
+                name, zones, self._instrument.sample_rate, dest,
+                progress=lambda msg, frac: self._on_progress(f"export: {msg}", frac),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"export failed: {exc}")
+            return
+        into_logic = str(logic_export.LOGIC_SAMPLER_INSTRUMENTS) in str(exs_path)
+        where = "Logic → Sampler → instrument menu" if into_logic else str(exs_path.parent)
+        layout = "round-robin" if round_robin else "velocity-split"
+        loud = "  ·  equal-loudness" if self._equal_loudness else ""
+        self.status.setText(f"exported '{name}'  ·  {layout}{loud}  ·  {where}")
 
     @Slot()
     def _on_adsr_changed(self) -> None:
@@ -1283,12 +1444,38 @@ class MainWindow(QMainWindow):
         self._store_controls_to_active()
 
     @Slot(bool)
-    def _on_vlayer_toggled(self, checked: bool) -> None:
-        """Toggle velocity-layered sample selection. Refresh the arrow selector
-        so it reflects whether it still drives playback (it's disabled while
-        velocity layers are on)."""
-        self._velocity_layers = checked
+    def _on_equal_loudness_toggled(self, checked: bool) -> None:
+        # Gains are precomputed per kit; the toggle just enables applying them.
+        self._equal_loudness = checked
+
+    def _apply_loudness_gains(self) -> None:
+        """(Re)compute A-weighted equal-loudness gains over the whole current kit
+        (all keys + unassigned) and stash one on each segment. Cheap; run after
+        any analysis / kit load / recategorize so the gains match the sample set."""
+        segs = [s for v in self._instrument.notes.values() for s in v]
+        segs += list(self._instrument.unassigned)
+        if not segs:
+            return
+        gains = equal_loudness_gains(
+            [s.audio for s in segs], self._instrument.sample_rate)
+        for s, g in zip(segs, gains):
+            s.loudness_gain = float(g)
+
+    def _set_sample_mode(self, mode: str) -> None:
+        """Switch the per-hit sample-pick mode (RANDOM ↔ VEL LAYER) and refresh
+        the ◀ N/M ▶ readout so it reflects what drives playback."""
+        self._sample_mode = mode
         self._update_sample_selector()
+
+    @Slot(bool)
+    def _on_per_sample_edit_toggled(self, checked: bool) -> None:
+        """Flip volume/envelope/filter edits between whole-cluster (off) and
+        single active sample (on). Reload the controls from the active sample so
+        what's shown matches what the next edit will write."""
+        self._per_sample_edit = checked
+        seg = self._active_segment()
+        if seg is not None:
+            self._load_settings_into_controls(self._settings_for(seg))
 
     # ---------- per-sample playback settings ----------
 
@@ -1303,6 +1490,17 @@ class MainWindow(QMainWindow):
         idx = self._sample_choice.get(key, 0) % len(segs)
         return segs[idx]
 
+    def _edit_target_segments(self) -> list:
+        """Segments the VOLUME/ENVELOPE/FILTER controls write to. Whole cluster
+        (the selected key's samples) by default; just the active sample when
+        PER-SAMPLE EDIT is on."""
+        if self._per_sample_edit:
+            seg = self._active_segment()
+            return [seg] if seg is not None else []
+        key = self._selected_key
+        segs = self._instrument.notes.get(key) if key is not None else None
+        return list(segs) if segs else []
+
     def _settings_for(self, seg) -> PlaybackSettings:
         """Get (creating if needed) the PlaybackSettings stored on a segment."""
         if seg.playback is None:
@@ -1310,40 +1508,40 @@ class MainWindow(QMainWindow):
         return seg.playback
 
     def _store_controls_to_active(self) -> None:
-        """Write the current control values into the active sample's settings."""
+        """Write the current volume/envelope/filter/loop controls onto the edit
+        target (whole cluster, or the active sample when PER-SAMPLE EDIT is on).
+
+        Velocity is a live, global hit control now (both sample-pick modes use
+        the slider as the hit velocity), so it's never stamped per-sample — each
+        segment keeps whatever velocity it already had."""
         if self._loading_settings:
             return
-        seg = self._active_segment()
-        if seg is None:
-            return
-        # In velocity-layers mode the slider is the global hit velocity, so keep
-        # each sample's own stored velocity rather than stamping the slider on it.
-        velocity = (self._settings_for(seg).velocity if self._velocity_layers
-                    else self.vel_slider.value())
-        seg.playback = PlaybackSettings(
-            velocity=velocity,
-            loop=self.loop_check.isChecked(),
-            a=self.a_slider.value(),
-            d=self.d_slider.value(),
-            s=self.s_slider.value(),
-            r=self.r_slider.value(),
-            lpf=self.lpf_slider.value(),
-        )
+        for seg in self._edit_target_segments():
+            cur = self._settings_for(seg)
+            seg.playback = PlaybackSettings(
+                velocity=cur.velocity,
+                loop=self.loop_check.isChecked(),
+                a=self.a_slider.value(),
+                d=self.d_slider.value(),
+                s=self.s_slider.value(),
+                r=self.r_slider.value(),
+                lpf=self.lpf_slider.value(),
+                volume=self.volume_slider.value(),
+            )
 
     def _load_settings_into_controls(self, st: PlaybackSettings) -> None:
-        """Push a sample's settings into the controls without writing back."""
+        """Push a sample's settings into the controls without writing back.
+        Velocity is a global live control, so key/sample selection never moves
+        the velocity slider."""
         self._loading_settings = True
         try:
-            # In velocity-layers mode the slider is the global hit velocity, not
-            # a per-sample setting, so don't let key/sample selection clobber it.
-            if not self._velocity_layers:
-                self.vel_slider.setValue(st.velocity)
             self.loop_check.setChecked(st.loop)
             self.a_slider.setValue(st.a)
             self.d_slider.setValue(st.d)
             self.s_slider.setValue(st.s)
             self.r_slider.setValue(st.r)
             self.lpf_slider.setValue(st.lpf)
+            self.volume_slider.setValue(getattr(st, "volume", 100))
         finally:
             self._loading_settings = False
         a, d, s, r = self._adsr_values()
@@ -1376,7 +1574,6 @@ class MainWindow(QMainWindow):
             self._all_segments, sort_by_freq=checked
         )
         self._octave = 0
-        self._classify_clusters()
         self._refresh_octave_view()
 
     def _sync_adsr_to_engine(self) -> None:
@@ -1443,39 +1640,47 @@ class MainWindow(QMainWindow):
         self._select_key(cluster_idx, note_index)
         self._play_selected_sample(cluster_idx)
 
-    def _velocity_layer_index(self, n: int) -> int:
-        """Map the velocity slider (1..127) to a stacked-sample index (0..n-1).
-        Segments are pre-sorted by loudness (rms), so soft→loud picks low→high."""
-        vel = self.vel_slider.value()
-        idx = int((vel - 1) / 126.0 * n)
+    def _velocity_layer_index(self, n: int, vel: Optional[int] = None) -> int:
+        """Map a velocity (1..127) to a stacked-sample index (0..n-1). Segments
+        are pre-sorted by loudness (rms), so soft→loud picks low→high. Defaults to
+        the VELOCITY slider; a live hit (e.g. MIDI) passes its own velocity."""
+        v = self.vel_slider.value() if vel is None else vel
+        idx = int((v - 1) / 126.0 * n)
         return max(0, min(n - 1, idx))
 
     def _play_selected_sample(self, cluster_idx: int,
-                              force_idx: Optional[int] = None) -> None:
+                              force_idx: Optional[int] = None,
+                              velocity: Optional[int] = None) -> None:
         """Play a sample on a key using that sample's own playback settings.
 
         Sample choice:
-          - `force_idx` given  → play exactly that index (arrow auditioning).
-          - velocity layers on → the velocity slider picks the sample (by rms).
-          - otherwise          → the arrow-tab choice.
-        With velocity layers on, the slider velocity also drives gain/darkening,
-        so a harder "hit" both selects a louder layer and plays louder.
+          - `force_idx` given   → play exactly that index (arrow auditioning).
+          - VEL LAYER mode      → the hit velocity picks the sample (by rms).
+          - RANDOM mode         → a random sample from the cluster fires.
+          - single-sample key   → that one sample.
+        Hit velocity is the VELOCITY slider by default, or `velocity` when a live
+        controller (MIDI keyboard) supplies a real per-hit velocity; it drives
+        gain, the darkening lowpass, and VEL LAYER selection.
         """
         segs = self._instrument.notes.get(cluster_idx)
         if not segs:
             return
+        vel = self.vel_slider.value() if velocity is None else velocity
         if force_idx is not None:
             idx = force_idx % len(segs)
-        elif self._velocity_layers and len(segs) > 1:
-            idx = self._velocity_layer_index(len(segs))
+        elif len(segs) > 1 and self._sample_mode == "velocity":
+            idx = self._velocity_layer_index(len(segs), vel)
+        elif len(segs) > 1 and self._sample_mode == "random":
+            idx = random.randrange(len(segs))
         else:
             idx = self._sample_choice.get(cluster_idx, 0) % len(segs)
         seg = segs[idx]
         st = self._settings_for(seg)
-        # In velocity-layers mode the live slider is the hit velocity; otherwise
-        # use the sample's stored velocity.
-        vel = self.vel_slider.value() if self._velocity_layers else st.velocity
-        gain = vel / 127.0
+        # Live hit velocity × the sample's own stored VOLUME trim, × the
+        # A-weighted equal-loudness gain when EQUAL LOUDNESS is on.
+        gain = (vel / 127.0) * (getattr(st, "volume", 100) / 100.0)
+        if self._equal_loudness:
+            gain *= float(getattr(seg, "loudness_gain", 1.0))
         adsr = (st.a * 0.01, st.d * 0.01, st.s / 100.0, st.r * 0.02)
         cutoff_hz = self._lpf_from_slider(st.lpf)
         # Velocity also applies the subtle darkening lowpass on top of the
@@ -1503,9 +1708,10 @@ class MainWindow(QMainWindow):
         self.step_grid.setPattern(pattern)
 
     def _update_sample_selector(self) -> None:
-        """Refresh the ◀ N/M ▶ readout for the selected key. With velocity layers
-        on, the slider (not the arrows) drives playback, so the arrows become an
-        auditioning aid and the readout shows the live velocity-selected layer."""
+        """Refresh the ◀ N/M ▶ readout for the selected key. In VEL LAYER mode the
+        slider (not the arrows) drives playback, so the arrows are an auditioning
+        aid and the readout shows the live velocity-selected layer. In RANDOM mode
+        the readout shows the arrow-chosen sample (used for auditioning/editing)."""
         key = self._selected_key
         segs = self._instrument.notes.get(key) if key is not None else None
         n = len(segs) if segs else 0
@@ -1515,7 +1721,7 @@ class MainWindow(QMainWindow):
         if not has:
             self.sample_lbl.setText("– / –")
             return
-        if self._velocity_layers and n > 1:
+        if self._sample_mode == "velocity" and n > 1:
             idx = self._velocity_layer_index(n)
             self.sample_lbl.setText(f"vel {idx + 1} / {n}")
         else:
@@ -1536,8 +1742,8 @@ class MainWindow(QMainWindow):
         seg = self._active_segment()
         if seg is not None:
             self._load_settings_into_controls(self._settings_for(seg))
-        # Audition exactly the arrow-chosen sample, even if velocity layers are
-        # on (which would otherwise pick by velocity on a real key press).
+        # Audition exactly the arrow-chosen sample, regardless of sample-pick
+        # mode (which would otherwise pick by velocity or at random on a key press).
         self._play_selected_sample(key, force_idx=idx)
 
     @Slot(int)
@@ -1552,6 +1758,45 @@ class MainWindow(QMainWindow):
     def _on_note_released(self, note_index: int) -> None:
         cluster_idx = note_index + self._octave * OCTAVE_STEP
         self._engine.release_note(cluster_idx)
+
+    # ============================================================
+    # USB MIDI
+    # ============================================================
+
+    @Slot(int, int)
+    def _on_midi_note_on(self, note: int, velocity: int) -> None:
+        """MIDI note → cluster (note − BASE_MIDI_NOTE, matching the Logic export),
+        played with the real MIDI velocity. Playing never steals the edit focus —
+        it only lights the on-screen key if the note is in the visible octave."""
+        cluster_idx = note - BASE_MIDI_NOTE
+        if cluster_idx < 0 or not self._instrument.notes.get(cluster_idx):
+            return
+        note_index = cluster_idx - self._octave * OCTAVE_STEP
+        if 0 <= note_index < N_VISIBLE_KEYS:
+            self.piano.show_pressed(note_index)
+        self._play_selected_sample(cluster_idx, velocity=velocity)
+
+    @Slot(int)
+    def _on_midi_note_off(self, note: int) -> None:
+        cluster_idx = note - BASE_MIDI_NOTE
+        if cluster_idx < 0:
+            return
+        self._engine.release_note(cluster_idx)
+        note_index = cluster_idx - self._octave * OCTAVE_STEP
+        if 0 <= note_index < N_VISIBLE_KEYS:
+            self.piano.show_released(note_index)
+
+    def _poll_midi(self) -> None:
+        """Connect the first MIDI input, and detect plug/unplug, on a timer."""
+        if not MidiListener.available():
+            self.midi_lbl.setText("MIDI: (install python-rtmidi)")
+            return
+        if self._midi.is_connected() and not self._midi.still_present():
+            self._midi.disconnect()          # device was unplugged
+        if not self._midi.is_connected():
+            self._midi.connect_first()
+        name = self._midi.port_name
+        self.midi_lbl.setText(f"MIDI ● {name}" if name else "MIDI: —")
 
     # ============================================================
     # window-level keyboard
@@ -1591,5 +1836,7 @@ class MainWindow(QMainWindow):
         if self._thread is not None and self._thread.isRunning():
             self._thread.quit()
             self._thread.wait(2000)
+        self._midi_timer.stop()
+        self._midi.disconnect()
         self._engine.stop()
         super().closeEvent(event)

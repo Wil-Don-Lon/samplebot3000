@@ -136,3 +136,14 @@ def get_embedder(name: str = "clap") -> Embedder:
     if name not in _BACKENDS:
         raise ValueError(f"unknown embedder {name!r} (have {list(_BACKENDS)})")
     return _BACKENDS[name]()
+
+
+def embedder_available() -> bool:
+    """True if the optional `[clap]` extras (torch + transformers) are installed.
+
+    Uses find_spec so it never imports the heavy libraries — cheap enough to
+    call at GUI build time to decide whether CLAP-backed models can run.
+    """
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None
+               for m in ("torch", "transformers"))

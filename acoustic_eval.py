@@ -24,7 +24,7 @@ import numpy as np
 from datasets_loader import load_idmt
 from embed_eval import get_data as get_machine_data
 from embedders import get_embedder
-from pipeline import pitch_temporal_features
+from pipeline import pitch_temporal_features, TARGET_SR
 from classifier import make_model
 
 KSH = ["kick", "snare", "hats"]  # classes IDMT provides
@@ -42,7 +42,7 @@ def extract_idmt(batch_size: int = 64):
     print(f"Embedding {len(slices)} IDMT slices…")
     X = np.empty((len(slices), emb.dim), dtype=np.float32)
     for i in range(0, len(slices), batch_size):
-        X[i:i + batch_size] = emb.embed_batch(slices[i:i + batch_size], 44100)
+        X[i:i + batch_size] = emb.embed_batch(slices[i:i + batch_size], TARGET_SR)
         if (i // batch_size) % 10 == 0:
             print(f"  {min(i + batch_size, len(slices))}/{len(slices)}")
     S = np.stack([pitch_temporal_features(a) for a in slices]).astype(np.float32)
@@ -71,7 +71,8 @@ def _dedup(X, threshold=0.9995, labels=None, kits=None):
     keep = np.ones(len(X), dtype=bool)
     buckets: dict = {}
     for i in range(len(X)):
-        key = (kits[i], labels[i]) if labels is not None else 0
+        key = (None if kits is None else kits[i],
+               None if labels is None else labels[i])
         kept = buckets.setdefault(key, [])
         if any(float(X[i] @ X[j]) > threshold for j in kept):
             keep[i] = False

@@ -3,7 +3,8 @@
 Three clustering modes:
 - "manual"  : KMeans with a user-specified k
 - "auto"    : AgglomerativeClustering with a distance threshold
-- "hdbscan" : HDBSCAN with min_cluster_size; noise points get reassigned
+- "hdbscan" : HDBSCAN with min_cluster_size; noise points form one outlier
+              cluster routed to Instrument.unassigned (no key, not exported)
               to their nearest cluster's centroid so nothing is dropped.
 
 Feature vector (57 dims): captures timbre (MFCC mean/std), timbral evolution
@@ -20,6 +21,7 @@ top C of octave N is the same cluster as the low C of octave N+1.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Optional
 
 import numpy as np
@@ -48,6 +50,12 @@ SEGMENT_LENGTH_S = 0.5            # default PLAYBACK capture length (user-adjust
 # match the window the saved models/*.joblib were trained on. Clustering mode is
 # self-consistent per run, so it keeps using the slider, not this.
 CLASSIFY_FEATURE_LEN_S = 0.5
+# Fixed window CLUSTERING features are computed over, decoupled from playback.
+# Tuned (grid search on the user's kit) to best reproduce their hand-drawn per-drum
+# slices: a short window captures the discriminative attack without dragging in
+# decay tails/bleed. The PLAYED sample uses the (longer) Sample Len slider, so the
+# short window that sorts well never shortens the audio you actually hear/export.
+CLUSTER_FEATURE_LEN_S = 0.7
 MIN_SEGMENT_S = 0.05
 MIN_ONSET_GAP_S = 0.10            # reject onsets less than 100ms apart
 TRIM_THRESHOLD_DB_DEFAULT = -38.0 # default silence threshold for trim (dBFS)
@@ -59,6 +67,12 @@ TRIM_SMOOTH_SAMPLES = 64          # ~1.5ms moving-average window for trim
 DEDUP_DISTANCE = 1.5
 
 MAX_KEYS = 48                     # 4 overlapping octaves' worth of unique slots
+
+# HDBSCAN labels density outliers -1. We keep them as ONE "outlier" cluster; the
+# key-mapping steps below don't give it a keyboard key but DO collect its
+# segments into Instrument.unassigned, so the odd-one-out hits can be placed by
+# hand in the recategorize dialog (and are never auto-exported to Logic).
+OUTLIER_CLUSTER = -1
 
 MIN_SEGMENT_SAMPLES = int(MIN_SEGMENT_S * TARGET_SR)
 
@@ -74,6 +88,8 @@ MIN_SEGMENT_SAMPLES = int(MIN_SEGMENT_S * TARGET_SR)
 #   [55]      flatness mean           tonal vs noise-like
 #   [56]      zero-crossing rate      noisiness
 CENTROID_MEAN_INDEX = 51
+ROLLOFF_MEAN_INDEX = 53
+ZCR_INDEX = 56
 
 
 ProgressCallback = Callable[[str, float], None]
@@ -91,7 +107,11 @@ class Segment:
     cluster: int = -1
     dominant_freq: float = 0.0   # FFT peak frequency, used for key ordering
     label: str = ""              # predicted class (classification mode)
+    label_conf: float = 0.0      # confidence in `label` (cluster-consensus typing)
     playback: object = None      # per-sample PlaybackSettings (set by the GUI)
+    # A-weighted equal-loudness gain (≤1 tames bright/harsh samples); recomputed
+    # over the whole kit by the GUI, applied only when EQUAL LOUDNESS is on.
+    loudness_gain: float = 1.0
     # The fixed-window slice the classifier features were computed on (classify
     # mode only). Embedding-based classifiers re-embed THIS, not `audio` (the
     # variable-length playback slice), to stay train/serve-consistent.
@@ -102,6 +122,10 @@ class Segment:
 class Instrument:
     sample_rate: int = TARGET_SR
     notes: dict[int, list[Segment]] = field(default_factory=dict)
+    # Density outliers (HDBSCAN noise) that weren't confidently clustered. They
+    # get NO keyboard key and are NOT exported to Logic — they sit in the
+    # recategorize dialog's "UNASSIGNED" bucket to be placed by hand.
+    unassigned: list[Segment] = field(default_factory=list)
 
     def representative(self, note_index: int) -> Optional[Segment]:
         segs = self.notes.get(note_index)
@@ -475,15 +499,21 @@ def extract_segments(
             continue
         sample, feats = result
 
-        # Classification: recompute the feature vector over the FIXED window so
-        # it matches training regardless of the playback length. Ignores
-        # clip-at-next (training doesn't clip). Falls back to the played slice's
-        # features if the fixed window is unusable. Also stash the fixed-window
-        # slice so embedding classifiers can re-embed it consistently.
+        # Classification: recompute the feature vector over a window from this
+        # onset, capped at feature_length_s AND always clipped at the next onset.
+        # The next-onset clip is essential: on a real loop, hits are often closer
+        # together than feature_length_s, so a fixed window would bleed the NEXT
+        # hit (or two) into this one's features — describing a mixture, not this
+        # hit. Training one-shots are isolated, so an un-clipped serve window is a
+        # fatal train/serve mismatch (it made every classifier fail on loops).
+        # Isolated hits (gap > cap) are unaffected: the cap wins, matching training.
         classify_audio = None
         if feature_length_s is not None:
             fcap = int(feature_length_s * TARGET_SR)
-            fresult = segment_features(audio[start:start + fcap], trim_threshold_db)
+            fend = start + fcap
+            if i + 1 < len(onset_times):
+                fend = min(fend, int(onset_times[i + 1] * TARGET_SR))
+            fresult = segment_features(audio[start:fend], trim_threshold_db)
             if fresult is not None:
                 classify_audio, feats = fresult
 
@@ -579,14 +609,19 @@ def _normalize_features(segments: list[Segment],
 def _dedup_similar_segments(
     segments: list[Segment],
     distance_threshold: float = DEDUP_DISTANCE,
+    window_s: Optional[float] = None,
 ) -> list[Segment]:
     """Drop the shorter of any consecutive pair of segments with very similar
     features.
 
-    Window for "consecutive" is the longest trimmed segment's duration, so a
-    pair gets compared only if their onsets are within one full sample length
-    of each other. Within that window, if their z-score-normalized feature
-    vectors are within distance_threshold, the shorter audio is dropped.
+    Two onsets are compared only if within `window_s` of each other; within that
+    window, if their z-score-normalized feature vectors are within
+    distance_threshold, the shorter audio is dropped.
+
+    `window_s` should track the FEATURE/hit timescale, not the played length —
+    otherwise a long playback window (decoupled from the sort window) would widen
+    the dedup reach and start dropping genuinely-distinct nearby hits. Callers
+    pass the feature window; None falls back to the longest played sample (legacy).
 
     This is the step that catches double-triggered transients: same physical
     hit, two onsets, two segments that look near-identical in feature space.
@@ -598,10 +633,9 @@ def _dedup_similar_segments(
 
     Xn = _normalize_features(segments)
     order = sorted(range(len(segments)), key=lambda i: segments[i].onset_time)
-    # Window = longest trimmed sample duration so the comparison reach scales
-    # with the actual material.
     sr = TARGET_SR
-    longest_s = max(s.audio.size / sr for s in segments)
+    longest_s = (float(window_s) if window_s is not None
+                 else max(s.audio.size / sr for s in segments))
     keep = [True] * len(segments)
 
     for k in range(len(order)):
@@ -671,12 +705,13 @@ def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int,
     - min_samples=1 keeps density requirements permissive.
     - cluster_selection_epsilon=0: no force-merge of close clusters.
 
-    Noise points get their OWN clusters (via a separate KMeans pass on
-    just the noise subset), not reassigned to existing centroids.
-    Reassigning was the previous behavior and it was bad: "nearest" in
-    57-dim space does not mean "similar," so noise points contaminated
-    the coherent clusters HDBSCAN found. Now noise stays quarantined in
-    its own buckets.
+    Noise points stay as a single OUTLIER_CLUSTER (label -1). Downstream
+    key-mapping gives them no keyboard key but collects them into
+    Instrument.unassigned, so the odd-one-out hits land in the recategorize
+    dialog's "UNASSIGNED" bucket for manual placement (and are never exported).
+    Reassigning them (old behavior) was bad: "nearest" in 57-dim space does not
+    mean "similar," so noise contaminated the coherent clusters; re-clustering
+    them onto their own keys just littered the kit with junk.
 
     If HDBSCAN labels more than 70% of points as noise we treat that as
     "couldn't find structure" and fall back to plain KMeans rather than
@@ -690,15 +725,20 @@ def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int,
 
     Xn = _normalize_features(segments, feature_matrix)
     n = len(segments)
-    # Cap mcs at half the dataset — asking for clusters larger than that
-    # guarantees almost everything ends up as noise.
-    mcs = max(2, min(int(min_cluster_size), max(2, n // 2)))
+    # Decimal diversity: the integer part is min_cluster_size; the fractional part
+    # (e.g. the .5 in 5.5) becomes a small cluster-merge epsilon, so half-steps
+    # smoothly interpolate granularity between consecutive integer sizes instead
+    # of being rounded away.
+    div = float(min_cluster_size)
+    mcs = max(2, min(int(div), max(2, n // 2)))
+    frac = div - int(div)
+    epsilon = frac * 0.25   # normalized-feature distance; 0.0 at whole numbers
 
     h = HDBSCAN(
         min_cluster_size=mcs,
         min_samples=1,
         cluster_selection_method="leaf",
-        cluster_selection_epsilon=0.0,
+        cluster_selection_epsilon=float(epsilon),
     )
     labels = h.fit_predict(Xn).astype(np.int64)
 
@@ -715,22 +755,9 @@ def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int,
             seg.cluster = int(lab)
         return segments
 
-    # Cluster noise points among themselves with KMeans, assigning fresh
-    # cluster IDs starting after HDBSCAN's highest. Noise stays separated
-    # from the real clusters; similar noise points stick together.
-    if n_noise > 0:
-        noise_idx = np.where(labels == -1)[0]
-        next_id = max(unique) + 1
-        if n_noise <= 2:
-            for i, idx in enumerate(noise_idx):
-                labels[idx] = next_id + i
-        else:
-            noise_k = max(2, min(n_noise // 4, 16))
-            km = KMeans(n_clusters=noise_k, n_init=5, random_state=42)
-            noise_labels = km.fit_predict(Xn[noise_idx])
-            for i, idx in enumerate(noise_idx):
-                labels[idx] = next_id + int(noise_labels[i])
-
+    # Noise points keep HDBSCAN's -1 label: they land in the single
+    # OUTLIER_CLUSTER, which every build_instrument_* step omits from the
+    # keymap. No re-clustering — the outliers simply don't get keys.
     for seg, lab in zip(segments, labels):
         seg.cluster = int(lab)
     return segments
@@ -831,85 +858,145 @@ def classify_segments(segments: list[Segment], model,
     return segments
 
 
-def cluster_consensus(segments: list[Segment], model,
-                      feature_matrix: np.ndarray) -> dict[int, tuple[str, float]]:
-    """Type each CLUSTER by SOFT CONSENSUS and return {cluster_id: (label, conf)}.
+# ---- Stage 2: CLAP-sort finished clusters onto drum types (no classifier) ----
 
-    For each cluster, average the classifier's per-slice class probabilities and
-    take the argmax — so the cluster is typed as a whole (robust to a few noisy
-    per-slice predictions). `conf` is that mean winning probability, used by hard
-    placement to rank which cluster best deserves a contested key. Mutates
-    seg.label.
+# Zero-shot CLAP prompt ensembles: several prompts per drum, averaged, give a more
+# robust text anchor than a single phrase. Used to LABEL whole clusters after
+# clustering — CLAP never touches the clustering step itself.
+DRUM_PROMPTS: dict[str, list[str]] = {
+    "kick":  ["a kick drum", "a bass drum", "a deep low kick drum thump"],
+    "snare": ["a snare drum", "an acoustic snare hit", "a snare drum with rattle"],
+    "clap":  ["a hand clap", "a clap"],
+    "hats":  ["a hi-hat cymbal", "a closed hi-hat", "an open hi-hat"],
+    "tom":   ["a tom drum", "a tom-tom", "a floor tom", "an acoustic tom hit"],
+    "crash": ["a crash cymbal", "a splashy crash cymbal wash"],
+    "ride":  ["a ride cymbal", "a ride cymbal ping", "a ride bell"],
+    "rim":   ["a rimshot", "a rim click", "a cross stick"],
+}
+# CLAP coarse label -> DRUM_KEYMAP class for placement (tom is resolved to
+# lo/mid/hi separately, by pitch).
+_CLAP_LABEL_TO_CLASS = {
+    "kick": "kick", "snare": "snare", "clap": "clap", "hats": "hats",
+    "crash": "crash", "ride": "ride", "rim": "snare",
+}
+
+
+@lru_cache(maxsize=1)
+def _drum_text_vectors() -> tuple[list[str], np.ndarray]:
+    """(drum names, per-drum mean prompt embedding matrix), built once.
+
+    Depends only on DRUM_PROMPTS + the cached CLAP model, so it's memoized —
+    the text encoder never re-runs across pipeline invocations. embed_text
+    already L2-normalizes each prompt row; we re-normalize only after averaging
+    the ensemble.
     """
+    from embedders import get_embedder
+    emb = get_embedder("clap")
+    drums = list(DRUM_PROMPTS)
+    vecs = []
+    for d in drums:
+        v = emb.embed_text(DRUM_PROMPTS[d]).astype(np.float64).mean(axis=0)
+        vecs.append(v / (np.linalg.norm(v) + 1e-8))
+    return drums, np.stack(vecs)
+
+
+def clap_sort_clusters(segments: list[Segment],
+                       progress: Optional[ProgressCallback] = None
+                       ) -> dict[int, tuple[str, float]]:
+    """Label each finished cluster by CLAP zero-shot + pitch, and set seg.label.
+
+    Stage 2 of the cluster-first pipeline: clustering has already grouped this
+    kit's sounds (seg.cluster set). Here we embed each cluster with CLAP, match
+    it to per-drum prompt ensembles by cosine, correct kick↔tom with the low-band
+    fundamental, and resolve tom clusters to lo/mid/hi KIT-RELATIVELY by pitch.
+    Returns {cluster_id: (leaf_label, confidence)}.
+    """
+    from embedders import get_embedder
     if not segments:
         return {}
-    X = feature_matrix
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)
-        classes = np.asarray(model.classes_)
-    else:  # hard fallback: one-hot the discrete predictions
-        preds = model.predict(X)
-        classes = np.asarray(sorted(set(map(str, preds))))
-        idx_of = {c: i for i, c in enumerate(classes)}
-        proba = np.zeros((len(preds), len(classes)), dtype=float)
-        for i, p in enumerate(preds):
-            proba[i, idx_of[str(p)]] = 1.0
+    emb = get_embedder("clap")
 
-    by_cluster: dict[int, list[int]] = {}
+    clusters: dict[int, list[int]] = {}
     for i, s in enumerate(segments):
-        by_cluster.setdefault(s.cluster, []).append(i)
+        if int(s.cluster) == OUTLIER_CLUSTER:
+            continue  # never label/place the outlier cluster
+        clusters.setdefault(int(s.cluster), []).append(i)
+
+    if progress:
+        progress("CLAP-sorting clusters…", 0.82)
+    slices = [s.classify_audio if s.classify_audio is not None else s.audio
+              for s in segments]
+    # embed_batch already L2-normalizes each row, so no re-normalize is needed.
+    A = emb.embed_batch(slices, TARGET_SR).astype(np.float64)
+    drums, Tmat = _drum_text_vectors()   # per-drum prompt embeddings, memoized
+
+    def cluster_f0(idx: list[int]) -> float:
+        return float(np.median([low_band_f0(segments[i].audio) for i in idx]))
+
+    # Coarse label per cluster: CLAP prior, then robust acoustic overrides.
+    # CLAP text can't separate cymbals well, but the hand-feature brightness cues
+    # do — and kit-relatively, so they generalize: hats are the brightest/noisiest
+    # thing in any kit, ride is brighter than crash, kick/toms are darkest.
+    coarse: dict[int, tuple[str, float, float]] = {}
+    for cid, idx in clusters.items():
+        cent = A[idx].mean(axis=0)
+        cent /= (np.linalg.norm(cent) + 1e-8)
+        sims = cent @ Tmat.T
+        j = int(sims.argmax())
+        label, conf = drums[j], float(sims[j])
+        feat = np.stack([segments[i].features for i in idx]).mean(axis=0)
+        centroid = float(feat[CENTROID_MEAN_INDEX])   # spectral brightness
+        rolloff = float(feat[ROLLOFF_MEAN_INDEX])     # high-frequency content
+        zcr = float(feat[ZCR_INDEX])                  # noisiness
+        # Low-band fundamental is only consulted on the low-drum branches below;
+        # compute it lazily so bright cymbal clusters skip the extra FFT.
+        f0 = -1.0
+        if (centroid < 1800.0 and zcr < 0.05) or label == "tom":
+            f0 = cluster_f0(idx)
+
+        # Treat anything bright+noisy as a cymbal candidate, even if CLAP guessed
+        # "snare", then split the cymbal family by high-frequency content:
+        # rolloff separates hats (very high) from ride; centroid separates the
+        # brighter ride from the darker crash.
+        cymbal_candidate = label in ("crash", "ride", "hats") or (
+            label == "snare" and centroid > 3000.0 and zcr > 0.12)
+        if cymbal_candidate:
+            if centroid < 1800.0 and zcr < 0.05:
+                # Dark, tonal-poor ⇒ a low drum. A clear mid-band fundamental
+                # means a tom; a low or unmeasurable f0 (kicks are boomy and
+                # often defeat the 40–400 Hz peak-pick → 0.0) means a kick.
+                label = "tom" if f0 >= 110.0 else "kick"
+            elif rolloff > 9200.0:
+                label = "hats"                        # brightest high-freq = hats
+            elif centroid > 3700.0:
+                label = "ride"                        # bright tonal cymbal
+            else:
+                label = "crash"                       # darker cymbal wash
+        elif label == "tom" and 0.0 < f0 < 70.0:
+            label = "kick"                            # very low tom is a kick
+        coarse[cid] = (label, conf, f0)
+
+    # Resolve toms to lo/mid/hi by ranking tom clusters on pitch (kit-relative).
+    # Split the pitch-sorted clusters into 3 contiguous tiers by INDEX, not by a
+    # pitch fraction, so N tom clusters spread as evenly as possible across
+    # lo/mid/hi — e.g. 4 toms → lo,lo,mid,hi rather than collapsing two onto hi.
+    tom_leaf: dict[int, str] = {}
+    tom_cids = sorted((c for c, v in coarse.items() if v[0] == "tom"),
+                      key=lambda c: coarse[c][2])
+    tiers = ("lotom", "midtom", "hitom")
+    n_tom = len(tom_cids)
+    for rank, c in enumerate(tom_cids):
+        tier = min(2, rank * 3 // n_tom) if n_tom else 1
+        tom_leaf[c] = tiers[tier]
+
     info: dict[int, tuple[str, float]] = {}
-    for cid, rows in by_cluster.items():
-        mean = proba[rows].mean(axis=0)
-        j = int(mean.argmax())
-        label = str(classes[j])
-        info[cid] = (label, float(mean[j]))
-        for i in rows:
-            segments[i].label = label
+    for cid, (label, conf, _f0) in coarse.items():
+        leaf = tom_leaf[cid] if label == "tom" else _CLAP_LABEL_TO_CLASS.get(label, label)
+        info[cid] = (leaf, conf)
+        for i in clusters[cid]:
+            segments[i].label = leaf
+            segments[i].label_conf = conf
     return info
-
-
-def build_instrument_drumkeys_hard(
-    segments: list[Segment],
-    cluster_info: dict[int, tuple[str, float]],
-    n_keys: int = MAX_KEYS,
-) -> Instrument:
-    """Place clusters on the drum kit ONE PER KEY — no doubling up.
-
-    Each drum key holds at most one cluster. Clusters are placed in order of
-    confidence: the most confident cluster claims the first free key of its type
-    (the "most kick-like cluster" really does win KICK). When a type's keys are
-    all taken, that cluster overflows to the nearest remaining empty drum key
-    rather than stacking — so distinct clusters stay on distinct keys.
-    """
-    if not segments:
-        return Instrument()
-    clusters: dict[int, list[Segment]] = {}
-    for s in segments:
-        clusters.setdefault(s.cluster, []).append(s)
-
-    drum_keys = [k for k, _c, _l in DRUM_KEYMAP]          # 0..16, layout order
-    taken: set[int] = set()
-    inst = Instrument()
-    # Most confident clusters get first pick of their type's keys.
-    for cid in sorted(clusters, key=lambda c: cluster_info.get(c, ("", 0.0))[1],
-                      reverse=True):
-        label = cluster_info.get(cid, ("", 0.0))[0]
-        prefs = [k for k in CLASS_KEYS.get(label, []) if k not in taken]
-        if prefs:
-            key = prefs[0]
-        else:
-            spill = [k for k in drum_keys if k not in taken]
-            if not spill:
-                continue  # kit full (>17 clusters) — drop the overflow
-            key = spill[0]
-        taken.add(key)
-        segs = sorted(clusters[cid], key=lambda s: s.rms)
-        for s in segs:
-            s.cluster = key
-        if 0 <= key < n_keys:
-            inst.notes[key] = segs
-    return inst
 
 
 def build_instrument_drumkeys_by_cluster(
@@ -926,6 +1013,8 @@ def build_instrument_drumkeys_by_cluster(
         return Instrument()
     clusters: dict[int, list[Segment]] = {}
     for s in segments:
+        if s.cluster == OUTLIER_CLUSTER:
+            continue  # outliers get no key
         clusters.setdefault(s.cluster, []).append(s)
 
     # Group clusters by their (shared) consensus label.
@@ -950,6 +1039,9 @@ def build_instrument_drumkeys_by_cluster(
         if 0 <= k < n_keys:
             segs.sort(key=lambda s: s.rms)
             inst.notes[k] = segs
+    inst.unassigned = sorted(
+        (s for s in segments if s.cluster == OUTLIER_CLUSTER),
+        key=lambda s: s.rms)
     return inst
 
 
@@ -999,7 +1091,12 @@ def assign_keys_to_clusters(
 
     by_cluster: dict[int, list[Segment]] = {}
     for s in segments:
+        if s.cluster == OUTLIER_CLUSTER:
+            continue  # outliers get no key — collected into `unassigned` below
         by_cluster.setdefault(s.cluster, []).append(s)
+    instrument.unassigned = sorted(
+        (s for s in segments if s.cluster == OUTLIER_CLUSTER),
+        key=lambda s: s.rms)
 
     for cid in by_cluster:
         by_cluster[cid].sort(key=lambda s: s.rms)
@@ -1043,7 +1140,7 @@ def run_pipeline(
     n_keys: int = MAX_KEYS,
     classifier_model=None,
     classifier_feature_type: str = "hand",
-    cluster_clap_mode: str = "off",   # off | soft | hard (clustering placement)
+    clap_sort: bool = False,          # Stage 2: CLAP-sort clusters onto drum keys
     clip_at_next_onset: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Instrument:
@@ -1060,6 +1157,15 @@ def run_pipeline(
         report("No onsets detected — try raising sensitivity.", 1.0)
         return Instrument()
 
+    # Feature window is ALWAYS decoupled from the played sample length:
+    #  - classify / CLAP-sort: a fixed CLASSIFY_FEATURE_LEN_S window (train/serve
+    #    consistency + CLAP's expected slice).
+    #  - pure clustering: the tuned CLUSTER_FEATURE_LEN_S window (short = best drum
+    #    separation) — while the Sample Len slider only sets the PLAYED length, so
+    #    long ring-outs (crashes, open hats) aren't chopped by the sort window.
+    feature_length_s = (CLASSIFY_FEATURE_LEN_S if (mode == "classify" or clap_sort)
+                        else CLUSTER_FEATURE_LEN_S)
+
     report(f"Extracting {len(onsets)} segments…", 0.40)
     segments = extract_segments(
         audio, onsets,
@@ -1067,16 +1173,16 @@ def run_pipeline(
         trim_threshold_db=trim_threshold_db,
         noise_gate_db=noise_gate_db,
         clip_at_next_onset=clip_at_next_onset,
-        # Classification features come from a fixed window so the Sample Len
-        # slider can't reintroduce train/serve skew; clustering uses the slider.
-        feature_length_s=(CLASSIFY_FEATURE_LEN_S if mode == "classify" else None),
+        feature_length_s=feature_length_s,
     )
     if not segments:
         report("No usable segments — all were silent, too short, or below the gate.", 1.0)
         return Instrument()
 
     n_before_dedup = len(segments)
-    segments = _dedup_similar_segments(segments)
+    # Dedup on the FEATURE/hit timescale, not the (possibly long) played length,
+    # so lengthening playback never widens the dedup reach.
+    segments = _dedup_similar_segments(segments, window_s=feature_length_s)
     n_dedup = n_before_dedup - len(segments)
     if n_dedup > 0:
         report(f"Deduped {n_dedup} similar segments…", 0.55)
@@ -1084,42 +1190,35 @@ def run_pipeline(
     n_kept = len(segments)
     n_dropped = len(onsets) - n_kept
 
-    use_clap = cluster_clap_mode in ("soft", "hard")
     cluster_info = None  # set when CLAP types clusters for drum-kit placement
     if mode == "classify":
         report(f"Classifying {n_kept} segments…", 0.70)
         classify_segments(segments, classifier_model, classifier_feature_type)
     else:
-        # Clustering. Optionally cluster in CLAP-embedding space (richer timbre
-        # grouping) instead of the 57-dim hand-crafted features.
-        clap_feats = None
-        if use_clap:
-            report(f"Embedding {n_kept} segments (CLAP)…", 0.62)
-            clap_feats = classify_feature_matrix(segments, "fused_clap")
-        space = "CLAP" if use_clap else "57-dim"
+        # STAGE 1 — cluster first, on the current feature space (NOT CLAP-space).
+        # The clustering that already works stays exactly as-is; CLAP is only
+        # applied afterward, in Stage 2.
         if mode == "hdbscan":
-            report(f"HDBSCAN on {n_kept} ({space}, min size {min_cluster_size})…", 0.70)
-            cluster_segments_hdbscan(segments, min_cluster_size, clap_feats)
+            report(f"HDBSCAN on {n_kept} (57-dim, min size {min_cluster_size})…", 0.70)
+            cluster_segments_hdbscan(segments, min_cluster_size)
         elif mode == "auto":
-            report(f"Agglomerative on {n_kept} ({space}, threshold {threshold:.1f})…", 0.70)
-            cluster_segments_auto(segments, threshold, clap_feats)
+            report(f"Agglomerative on {n_kept} (57-dim, threshold {threshold:.1f})…", 0.70)
+            cluster_segments_auto(segments, threshold)
         else:
             n_eff = max(1, min(n_clusters, n_kept))
-            report(f"KMeans on {n_kept} ({space}, k={n_eff})…", 0.70)
-            cluster_segments(segments, n_eff, clap_feats)
-        # With CLAP + a classifier, type each cluster and lay it on the drum kit
-        # (kick-like cluster → kick key, …) instead of generic cluster-per-key.
-        if use_clap and classifier_model is not None:
-            report("Typing clusters → drum kit…", 0.85)
-            cluster_info = cluster_consensus(segments, classifier_model, clap_feats)
+            report(f"KMeans on {n_kept} (57-dim, k={n_eff})…", 0.70)
+            cluster_segments(segments, n_eff)
+        # STAGE 2 — CLAP-sort the finished clusters onto drum-kit keys.
+        if clap_sort:
+            cluster_info = clap_sort_clusters(segments, progress=report)
 
-    n_clusters_found = len({s.cluster for s in segments})
+    n_clusters_found = len({s.cluster for s in segments
+                            if s.cluster != OUTLIER_CLUSTER})
     report("Building instrument…", 0.90)
     if mode == "classify":
         instrument = build_instrument_drumkeys(segments, n_keys=n_keys)
-    elif cluster_info is not None and cluster_clap_mode == "hard":
-        instrument = build_instrument_drumkeys_hard(segments, cluster_info, n_keys=n_keys)
-    elif cluster_info is not None:  # soft
+    elif cluster_info is not None:
+        # CLAP-sorted clusters land whole on their labeled drum keys.
         instrument = build_instrument_drumkeys_by_cluster(segments, n_keys=n_keys)
     else:
         instrument = build_instrument(segments, n_keys=n_keys)
@@ -1137,5 +1236,8 @@ def run_pipeline(
     grouping = "classes" if mode == "classify" else "clusters"
     parts.append(f"→ {n_clusters_found} {grouping} → {n_loaded} keys")
     parts.append(f"across {n_octaves} octave{'s' if n_octaves != 1 else ''}.")
+    n_unassigned = len(instrument.unassigned)
+    if n_unassigned:
+        parts.append(f"{n_unassigned} unassigned (recategorize to place).")
     report(" ".join(parts), 1.0)
     return instrument

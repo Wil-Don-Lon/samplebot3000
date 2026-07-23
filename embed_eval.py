@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import load_audio, features_from_oneshot, pitch_temporal_features
+from pipeline import load_audio, features_from_oneshot, pitch_temporal_features, TARGET_SR
 from sort_samples import classify as name_classify
 from model_analysis import RAW, LABEL_MAP, AUDIO_EXTS
 from classifier import make_model
@@ -70,7 +70,7 @@ def extract(backend: str, batch_size: int = 32):
     print(f"\nEmbedding {len(slices)} slices via {backend} (batch {batch_size})…")
     X = np.empty((len(slices), emb.dim), dtype=np.float32)
     for i in range(0, len(slices), batch_size):
-        X[i:i + batch_size] = emb.embed_batch(slices[i:i + batch_size], 44100)
+        X[i:i + batch_size] = emb.embed_batch(slices[i:i + batch_size], TARGET_SR)
         if (i // batch_size) % 10 == 0:
             print(f"  {i + min(batch_size, len(slices) - i)}/{len(slices)}")
     S = np.stack(scalars).astype(np.float32)

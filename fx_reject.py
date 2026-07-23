@@ -65,7 +65,8 @@ def _report(true, pred, taus, maxconf, classes):
     print(f"  10-class macro-F1 : {f1:.3f}   (fx-as-class baseline: 0.75 overall, fx F1 0.48)")
     print(f"  FX precision      : {fx_p:.3f}")
     print(f"  FX recall         : {fx_r:.3f}")
-    print(f"  FX F1             : {2*fx_p*fx_r/max(fx_p+fx_r,1e-9):.3f}")
+    fx_f1 = f1_score(true == "fx", p == "fx", zero_division=0)
+    print(f"  FX F1             : {fx_f1:.3f}")
     print(f"  real-class macro-F1 (not over-rejected?): {real_f1:.3f}")
     return tau
 

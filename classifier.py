@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -53,8 +54,7 @@ MODEL_NAMES = ["svm", "rf", "knn", "gb", "mlp"]
 # Embedding-based models: features are CLAP audio embedding ++ pitch/temporal
 # scalars (brief §2+§3), not the 57-dim hand-crafted vector. Their bundles carry
 # feature_type="fused_clap" so the pipeline re-embeds at inference.
-EMBED_MODEL_NAMES = ["clap"]
-ALL_MODEL_NAMES = EMBED_MODEL_NAMES + MODEL_NAMES  # CLAP first = preferred default
+ALL_MODEL_NAMES = ["clap"] + MODEL_NAMES  # CLAP first = preferred default
 
 # Human-readable names for the GUI picker.
 MODEL_LABELS = {
@@ -73,6 +73,20 @@ def _trained_base_models() -> list[str]:
     if not MODEL_DIR.exists():
         return []
     return [n for n in ALL_MODEL_NAMES if (MODEL_DIR / f"{n}.joblib").exists()]
+
+
+HYBRID_DOMAINS = ["acoustic", "electronic"]
+
+
+def available_hybrids() -> list[str]:
+    """Domains ('acoustic'/'electronic') with a trained hybrid bundle on disk.
+
+    The app uses ONLY the hybrid classifier; the GUI offers these as a domain
+    toggle. Load one with load_bundle(f'hybrid_{domain}')."""
+    if not MODEL_DIR.exists():
+        return []
+    return [d for d in HYBRID_DOMAINS
+            if (MODEL_DIR / f"hybrid_{d}.joblib").exists()]
 
 
 def available_models() -> list[str]:
@@ -311,6 +325,29 @@ def cmd_train_clap() -> None:
     print("Saved -> models/clap.joblib")
 
 
+def _file_feature_matrix(path: Path, feature_type: str) -> np.ndarray | None:
+    """One-row feature matrix for a single file, matching how the model trained.
+
+    "hand" → the 57-dim vector; "fused_clap" → CLAP embedding ++ pitch/temporal
+    scalars over the fixed-window slice (same representation as extract_fused_all).
+    """
+    if feature_type == "fused_clap":
+        from embedders import get_embedder
+        try:
+            audio = load_audio(str(path))
+        except Exception:
+            return None
+        r = features_from_oneshot(audio)
+        if r is None:
+            return None
+        sl = r[0]
+        E = get_embedder("clap").embed_batch([sl], TARGET_SR)
+        P = np.stack([pitch_temporal_features(sl)]).astype(np.float32)
+        return np.hstack([E, P]).astype(np.float64)
+    feats = file_features(path)
+    return None if feats is None else feats.reshape(1, -1).astype(np.float64)
+
+
 def cmd_predict(path: str, model: str) -> None:
     import joblib
 
@@ -319,12 +356,26 @@ def cmd_predict(path: str, model: str) -> None:
         print(f"No trained {model} model. Run: python classifier.py --train --model {model}")
         sys.exit(1)
     bundle = joblib.load(mp)
+    feature_type = bundle.get("feature_type", "hand")
+
+    if feature_type == "ensemble":
+        votes = []
+        for member, ftype in bundle["pipeline"]:
+            X = _file_feature_matrix(Path(path), ftype)
+            if X is None:
+                print("Could not read/analyse that file.")
+                sys.exit(1)
+            votes.append(str(member.predict(X)[0]))
+        pred = Counter(votes).most_common(1)[0][0]
+        print(f"Prediction: {pred}")
+        print("Votes: " + ", ".join(votes))
+        return
+
     pipe = bundle["pipeline"]
-    feats = file_features(Path(path))
-    if feats is None:
+    X = _file_feature_matrix(Path(path), feature_type)
+    if X is None:
         print("Could not read/analyse that file.")
         sys.exit(1)
-    X = feats.reshape(1, -1)
     pred = pipe.predict(X)[0]
     print(f"Prediction: {pred}")
     if hasattr(pipe, "predict_proba"):
