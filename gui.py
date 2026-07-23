@@ -1386,11 +1386,13 @@ class MainWindow(QMainWindow):
             self.status.setText("nothing to export — run an analysis or load a kit first.")
             return
         name = self.kit_name_edit.text().strip() or "Samplebot Kit"
-        # Default to Logic's user Sampler Instruments folder (create it if the
-        # audio-apps root exists), but let the user redirect anywhere.
-        start_dir = logic_export.LOGIC_SAMPLER_INSTRUMENTS
+        # Default into a single "Samplebot-3000" folder inside Logic's user
+        # Sampler Instruments — all app kits group there (Logic → Sampler →
+        # Samplebot-3000 → kit), instead of each kit making its own top-level
+        # folder. Let the user redirect anywhere.
+        start_dir = logic_export.LOGIC_SAMPLER_INSTRUMENTS / "Samplebot-3000"
         try:
-            if start_dir.parent.exists():
+            if start_dir.parent.parent.exists():
                 start_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass

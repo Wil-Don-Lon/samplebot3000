@@ -247,12 +247,15 @@ def _group_content(rr_prev: int = -1) -> bytes:
     b += _s8(0)          # volume
     b += _s8(0)          # pan
     b += _s8(0)          # polyphony (0 = max)
-    b += _s8(0)          # options
-    b += _s8(0)          # exclusive
+    b += _s8(1)          # options: bit0 = POLYPHONIC. Every factory drum kit sets
+    #                      this; leaving it 0 makes the group mono, so each hit
+    #                      cuts the previous — "all the drums cut each other off".
+    b += _s8(0)          # exclusive (voice/mute group) — 0 = none in every factory group
     b += _s8(0)          # min velocity
     b += _s8(127)        # max velocity
     b += _s8(0)          # sample-select random offset
-    b += b"\x00" * 8
+    b += _s8(255)        # (0xFF) — constant in factory drum-kit groups at offset 8
+    b += b"\x00" * 7
     b += _u16(0)         # release-trigger time
     b += b"\x00" * 14
     b += _s8(128)        # velocity range crossfade (+128 bias)
@@ -277,7 +280,7 @@ def _group_content(rr_prev: int = -1) -> bytes:
     b += _s8(0)          # enable-by type
     b += _s8(0)          # enable-by control value
     b += _s8(0)          # control low
-    b += _s8(127)        # control high
+    b += _s8(0)          # control high (factory drum groups use 0 here)
     b += _s8(0)          # start note
     b += _s8(127)        # end note
     b += _s8(0)          # midi channel
@@ -342,17 +345,18 @@ def write_exs_kit(
     dest_dir: Path,
     progress: Optional[Callable[[str, float], None]] = None,
 ) -> Path:
-    """Write `<dest_dir>/<KitName>/<KitName>.exs` plus one WAV per zone.
+    """Write `<dest_dir>/<KitName>.exs` plus its WAVs, flat into `dest_dir`.
 
-    Returns the path to the written .exs file. Raises ValueError if there are no
-    zones to export.
+    No redundant per-kit subfolder: the .exs sits directly in `dest_dir` (the GUI
+    points this at a single "Samplebot-3000" folder), and WAVs are named
+    `<KitName> - <zone>.wav` so several kits can share the folder without clashing.
+    Returns the path to the written .exs. Raises ValueError if there are no zones.
     """
     if not zones:
         raise ValueError("nothing to export — the kit has no samples")
 
     safe_kit = sanitize_name(kit_name)
-    dest_dir = Path(dest_dir)
-    kit_dir = dest_dir / safe_kit
+    kit_dir = Path(dest_dir)              # write flat here, no <KitName>/ subfolder
     kit_dir.mkdir(parents=True, exist_ok=True)
 
     bit_depth = 24
@@ -379,7 +383,7 @@ def write_exs_kit(
     for si, z in enumerate(unique_zones):
         if progress:
             progress(f"writing {z.name}.wav", si / max(1, total) * 0.7)
-        wav_path = kit_dir / f"{z.name}.wav"
+        wav_path = kit_dir / f"{safe_kit} - {z.name}.wav"
         audio = np.clip(np.asarray(z.audio, dtype=np.float32).ravel(), -1.0, 1.0)
         sf.write(str(wav_path), audio, int(sample_rate), subtype=subtype)
         sample_meta.append((
