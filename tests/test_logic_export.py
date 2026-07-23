@@ -143,8 +143,9 @@ def test_exs_roundtrip():
 
 
 def test_exs_round_robin():
-    # Uneven depths: key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. Round-robin pads
-    # shallower keys (reusing their own WAVs) so every group covers every key.
+    # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. Round-robin = one group per
+    # sample; a KEY's groups are chained via the EXS24 "previous group" link
+    # (offset 80): chain head = -1, each later group -> the prior group's index.
     notes = {
         0: [_make_seg(0.2), _make_seg(0.05), _make_seg(0.4)],
         5: [_make_seg(0.3), _make_seg(0.1)],
@@ -154,12 +155,10 @@ def test_exs_round_robin():
     zones = lx.instrument_to_zonespecs(
         notes, key_label=lambda k: labels[k], round_robin=True)
 
-    depth, n_keys = 3, 3
-    # depth * n_keys zones, all full-velocity, spread one-per-key across groups.
-    assert len(zones) == depth * n_keys
+    # One zone (and one group) per sample; every zone full-velocity.
+    assert len(zones) == 6
+    assert [z.group_index for z in zones] == [0, 1, 2, 3, 4, 5]
     assert all(z.vel_low == 1 and z.vel_high == 127 for z in zones)
-    for g in range(depth):
-        assert sum(1 for z in zones if z.group_index == g) == n_keys
 
     with tempfile.TemporaryDirectory() as d:
         exs_path = lx.write_exs_kit("RR Kit", zones, 44100, Path(d))
@@ -172,29 +171,32 @@ def test_exs_round_robin():
         samples = by_type[lx._TYPE_SAMPLE]
         zone_blocks = by_type[lx._TYPE_ZONE]
 
-        # depth groups; unique WAVs = 3+2+1 (padding shares, doesn't duplicate).
-        assert len(groups) == depth
-        assert len(samples) == 6
-        assert len(zone_blocks) == depth * n_keys
-
+        assert len(groups) == 6 and len(samples) == 6 and len(zone_blocks) == 6
         ic = by_type[lx._TYPE_INSTRUMENT][0][3]
         n_zones, n_groups, n_samples, _ = struct.unpack(">IIII", ic[4:20])
-        assert (n_zones, n_groups, n_samples) == (9, 3, 6)
+        assert (n_zones, n_groups, n_samples) == (6, 6, 6)
 
-        # Each group carries its round-robin sequence position (its index).
-        ref_rr = lx._group_content(rr_seq=0)
-        ref_off = lx._group_content(rr_seq=-1)
-        off = next(i for i in range(len(ref_rr)) if ref_rr[i] != ref_off[i])
+        # Read each group's round-robin previous-link (u32 at offset 80).
+        rr_prev = {}
         for _t, gi, _n, c in groups:
-            seq = struct.unpack(">I", c[off:off + 4])[0]
-            assert seq == gi, f"group {gi} rr-seq={seq}"
+            v = struct.unpack(">I", c[80:84])[0]
+            rr_prev[gi] = -1 if v == 0xFFFFFFFF else v
 
-        # Every zone points at a real group and sample, and every WAV exists.
-        kit_dir = exs_path.parent
+        # Group each zone's group by MIDI note; each key must be a valid chain.
+        by_note = {}
         for _t, _i, _n, c in zone_blocks:
+            note = c[1]
             gidx = struct.unpack(">I", c[88:92])[0]
-            sidx = struct.unpack(">I", c[92:96])[0]
-            assert 0 <= gidx < depth and 0 <= sidx < 6
+            by_note.setdefault(note, []).append(gidx)
+        # key 0->MIDI 36 (3 samples), 5->41 (2), 7->43 (1)
+        assert sorted(by_note) == [36, 41, 43]
+        for note, gs in by_note.items():
+            gs = sorted(gs)
+            assert rr_prev[gs[0]] == -1, f"note {note} head not -1"
+            for j in range(1, len(gs)):
+                assert rr_prev[gs[j]] == gs[j - 1], f"note {note} broken chain"
+
+        kit_dir = exs_path.parent
         for _t, _i, _n, c in samples:
             fname = c[336:592].split(b"\x00", 1)[0].decode("ascii")
             assert (kit_dir / fname).exists()

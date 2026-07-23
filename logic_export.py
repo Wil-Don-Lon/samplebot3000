@@ -125,32 +125,25 @@ def instrument_to_zonespecs(
                 ))
         return zones
 
-    # Round-robin: depth = deepest key; group g holds every key's g-th sample
-    # (cycling for shallower keys). Zones sharing a Segment.audio object dedup to
-    # one WAV in write_exs_kit, so padding costs no extra files.
-    depth = max(len(segs) for segs in valid.values())
-    # Pre-name each key's real samples once; padded zones reuse those names/audio.
+    # Round-robin, matching how Logic's own kits encode it: each sample on a key
+    # is its OWN group, full-velocity, and a key's groups are chained into a
+    # round-robin cycle by write_exs_kit (via the EXS24 group "previous group"
+    # link at offset 80). One group + one zone + one WAV per sample; no padding.
+    zones = []
     used = set()
-    per_key: dict[int, list[tuple[np.ndarray, str]]] = {}
+    gi = 0
     for key, segs in valid.items():
         label = sanitize_name(key_label(key), f"Key{key}")
         n = len(segs)
-        entries = []
+        midi_note = int(np.clip(base_note + key, 0, 127))
         for i, seg in enumerate(segs):
             base = f"{label}" if n == 1 else f"{label}_{i + 1}"
-            entries.append((aud(seg), _unique(base, used)))
-        per_key[key] = entries
-
-    zones = []
-    for g in range(depth):
-        for key, entries in per_key.items():
-            audio, name = entries[g % len(entries)]
-            midi_note = int(np.clip(base_note + key, 0, 127))
             zones.append(ZoneSpec(
-                audio=audio, name=name, midi_note=midi_note,
+                audio=aud(seg), name=_unique(base, used), midi_note=midi_note,
                 vel_low=1, vel_high=127, one_shot=one_shot,
-                group_index=g,
+                group_index=gi,
             ))
+            gi += 1
     return zones
 
 
@@ -245,9 +238,11 @@ def _zone_content(z: ZoneSpec, sample_index: int, group_index: int,
     return bytes(b)
 
 
-def _group_content(rr_seq: int = -1) -> bytes:
-    """Group block. `rr_seq` >= 0 sets this group's round-robin sequence position
-    (groups 0,1,2… cycle); -1 leaves round-robin off."""
+def _group_content(rr_prev: int = -1) -> bytes:
+    """Group block. `rr_prev` = index of the PREVIOUS group in this group's
+    round-robin chain (the EXS24 linked-list encoding Logic actually honors, at
+    offset 80); -1 marks a chain head / no round-robin. A key's groups form one
+    chain (head=-1, each next → prior group's index) so Logic cycles them."""
     b = bytearray()
     b += _s8(0)          # volume
     b += _s8(0)          # pan
@@ -278,7 +273,7 @@ def _group_content(rr_seq: int = -1) -> bytes:
     b += _s8(0)          # output
     b += _s8(0)          # enable-by-note value
     b += b"\x00" * 4
-    b += _u32(rr_seq if rr_seq >= 0 else 0xFFFFFFFF)  # round-robin group pos
+    b += _u32(rr_prev if rr_prev >= 0 else 0xFFFFFFFF)  # RR previous-group link (off 80)
     b += _s8(0)          # enable-by type
     b += _s8(0)          # enable-by control value
     b += _s8(0)          # control low
@@ -397,10 +392,20 @@ def write_exs_kit(
     if progress:
         progress("building instrument", 0.8)
 
-    # 3) Groups: one per distinct group_index. >1 group ⇒ round-robin, so each
-    #    group's sequence position is its index; a single group leaves RR off.
+    # 3) Groups: one per distinct group_index. Round-robin (RANDOM export) puts
+    #    each sample in its own group and chains a KEY's groups together via the
+    #    "previous group" link, exactly like Logic's factory kits: within each
+    #    key (same midi_note), the first group is the chain head (-1) and every
+    #    later group points to the prior one. Velocity-split has one group → -1.
     n_groups = max((z.group_index for z in zones), default=0) + 1
-    rr = n_groups > 1
+    rr_prev = [-1] * n_groups
+    chains: dict[int, list[int]] = {}
+    for z in zones:
+        chains.setdefault(z.midi_note, []).append(z.group_index)
+    for gidxs in chains.values():
+        ordered = sorted(set(gidxs))
+        for j in range(1, len(ordered)):
+            rr_prev[ordered[j]] = ordered[j - 1]
 
     # 4) Assemble the EXS blocks: instrument, zones, groups, samples, params.
     out = bytearray()
@@ -414,7 +419,7 @@ def write_exs_kit(
                                     group_index=z.group_index, length=length))
     for gi in range(n_groups):
         out += _block(_TYPE_GROUP, gi, safe_kit,
-                      _group_content(rr_seq=gi if rr else -1))
+                      _group_content(rr_prev=rr_prev[gi]))
     for si, z in enumerate(unique_zones):
         length, file_size, data_start, file_name = sample_meta[si]
         out += _block(_TYPE_SAMPLE, si, z.name,
