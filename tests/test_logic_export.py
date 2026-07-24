@@ -1,10 +1,10 @@
-"""Round-trip test for the EXS24 exporter.
+"""Round-trip test for the EXS24 exporter (modern little-endian "TBOS" format).
 
 Logic Pro itself can't run in CI, so instead we parse the written .exs back with
-the same block layout ConvertWithMoss (the reference reader) uses and assert the
-structure is self-consistent: block headers, instrument counts, zone<->sample
-linkage, key/velocity ranges, and that every referenced WAV exists with a
-matching data-chunk offset.
+the same block layout Logic's own factory kits use and assert the structure is
+self-consistent: block headers, instrument counts, zone<->sample linkage,
+key/velocity ranges, the populated (anti-gating) params block, and that every
+referenced WAV exists with a matching data-chunk offset.
 
 Run:  python -m pytest tests/test_logic_export.py -q
   or: python tests/test_logic_export.py
@@ -29,13 +29,13 @@ def _parse_blocks(data: bytes):
     i = 0
     blocks = []
     while i + 84 <= len(data):
-        assert data[i] == 0, "expected big-endian flag (0)"
+        assert data[i] == 1, "expected little-endian flag (1)"
         assert data[i + 1] == 1 and data[i + 2] == 0, "version must be 1.0"
-        btype = data[i + 3] & 0x0F
-        size = struct.unpack(">I", data[i + 4:i + 8])[0]
-        index = struct.unpack(">I", data[i + 8:i + 12])[0]
+        btype = data[i + 3] & 0x3F           # modern format ORs the type with 0x40
+        size = struct.unpack("<I", data[i + 4:i + 8])[0]
+        index = struct.unpack("<I", data[i + 8:i + 12])[0]
         magic = data[i + 16:i + 20]
-        assert magic == b"SOBT", f"bad magic {magic!r}"
+        assert magic == b"TBOS", f"bad magic {magic!r}"
         name = data[i + 20:i + 84].split(b"\x00", 1)[0].decode("ascii")
         content = data[i + 84:i + 84 + size]
         assert len(content) == size, "truncated block content"
@@ -82,31 +82,38 @@ def test_exs_roundtrip():
         group_blocks = by_type[lx._TYPE_GROUP]
         sample_blocks = by_type[lx._TYPE_SAMPLE]
         param_blocks = by_type[lx._TYPE_PARAMS]
+        output_blocks = by_type[lx._TYPE_OUTPUT]
 
         assert len(inst) == 1 and len(group_blocks) == 1 and len(param_blocks) == 1
         assert len(zone_blocks) == 3 and len(sample_blocks) == 3
+        assert len(output_blocks) == 6           # the six factory output blocks
 
-        # Instrument declares the right block counts.
+        # Instrument declares the right block counts (n_t8 at offset 32).
         ic = inst[0][3]
-        n_zones, n_groups, n_samples, n_params = struct.unpack(">IIII", ic[4:20])
+        n_zones, n_groups, n_samples, n_params = struct.unpack("<IIII", ic[4:20])
         assert (n_zones, n_groups, n_samples, n_params) == (3, 1, 3, 1)
+        assert struct.unpack("<I", ic[32:36])[0] == 6
+        assert struct.unpack("<I", ic[40:44])[0] == 0    # no trailing bplist
+
+        # The single group must be polyphonic (offset 3 bit0) with max voices
+        # (offset 2 = 0) — the per-group half of the anti-gating fix.
+        gc = group_blocks[0][3]
+        assert gc[2] == 0 and (gc[3] & 1), "group must be polyphonic / max voices"
 
         # Zones: verify key mapping, single-key range, velocity split, linkage.
         kit_dir = exs_path.parent
         seen_notes = []
         for btype, index, name, content in zone_blocks:
-            opts = content[0]
-            assert opts & 1, "drum zones must be one-shot"
-            assert opts & 8, "velocity range must be enabled"
+            assert content[0] & 1, "drum zones must be one-shot"
             key = content[1]
             key_low = content[6]
             key_high = content[7]
             vel_low = content[9]
             vel_high = content[10]
             assert key == key_low == key_high, "drum zone spans one key"
-            assert 1 <= vel_low <= vel_high <= 127
-            group_index = struct.unpack(">I", content[88:92])[0]
-            sample_index = struct.unpack(">I", content[92:96])[0]
+            assert 1 <= vel_high <= 127 and vel_low <= vel_high
+            group_index = struct.unpack("<I", content[88:92])[0]
+            sample_index = struct.unpack("<I", content[92:96])[0]
             assert group_index == 0
             assert sample_index == index, "zone i must reference sample i"
             seen_notes.append(key)
@@ -116,30 +123,35 @@ def test_exs_roundtrip():
 
         # The two zones on note 36 must partition velocity with no gap/overlap.
         note36 = sorted(
-            (struct.unpack(">I", c[92:96])[0], c[9], c[10])
+            (struct.unpack("<I", c[92:96])[0], c[9], c[10])
             for t, i, n, c in zone_blocks if c[1] == 36
         )
-        assert note36[0][1] == 1 and note36[-1][2] == 127
+        assert note36[-1][2] == 127
         assert note36[0][2] + 1 == note36[1][1], "velocity bands must be contiguous"
 
         # Samples: every referenced WAV exists and offsets/rates are right.
         for btype, index, name, content in sample_blocks:
-            wave_data_start = struct.unpack(">I", content[0:4])[0]
-            length = struct.unpack(">I", content[4:8])[0]
-            sr = struct.unpack(">I", content[8:12])[0]
-            bit_depth = struct.unpack(">I", content[12:16])[0]
-            channels = struct.unpack(">I", content[16:20])[0]
+            data_start = struct.unpack("<I", content[0:4])[0]
+            length = struct.unpack("<I", content[4:8])[0]
+            sr = struct.unpack("<I", content[8:12])[0]
+            bit_depth = struct.unpack("<I", content[12:16])[0]
+            channels = struct.unpack("<I", content[16:20])[0]
             ftype = content[28:32]
-            file_name = content[336:592].split(b"\x00", 1)[0].decode("ascii")
+            dir_path = content[80:336].split(b"\x00", 1)[0].decode("ascii")
+            file_name = content[336:600].split(b"\x00", 1)[0].decode("ascii")
             assert sr == 44100 and bit_depth == 24 and channels == 1
-            assert ftype == b"WAVE"
+            assert ftype == b"EVAW", "WAVE 4cc must be byte-reversed for LE"
             wav = kit_dir / file_name
             assert wav.exists(), f"missing {file_name}"
-            assert wave_data_start == lx._wav_data_offset(wav)
+            assert Path(dir_path) == kit_dir, "sample must store its absolute dir"
+            assert data_start == lx._wav_data_offset(wav)
             assert length == 2000
 
-        # Params block matches the fixed ConvertWithMoss default layout length.
-        assert len(param_blocks[0][3]) == 4 + 100 + 1000 + 4 + 400
+        # Params block is the populated factory layout (1108 bytes) carrying the
+        # global voice count that stops cross-key gating — NOT an all-zero block.
+        pc = param_blocks[0][3]
+        assert len(pc) == 1108
+        assert struct.unpack("<I", pc[112:116])[0] == 16, "global voices must be 16"
 
 
 def test_exs_round_robin():
@@ -173,20 +185,22 @@ def test_exs_round_robin():
 
         assert len(groups) == 6 and len(samples) == 6 and len(zone_blocks) == 6
         ic = by_type[lx._TYPE_INSTRUMENT][0][3]
-        n_zones, n_groups, n_samples, _ = struct.unpack(">IIII", ic[4:20])
+        n_zones, n_groups, n_samples, _ = struct.unpack("<IIII", ic[4:20])
         assert (n_zones, n_groups, n_samples) == (6, 6, 6)
 
-        # Read each group's round-robin previous-link (u32 at offset 80).
+        # Read each group's round-robin previous-link (u32 @80) and cycle flag (@90).
         rr_prev = {}
+        cycle = {}
         for _t, gi, _n, c in groups:
-            v = struct.unpack(">I", c[80:84])[0]
+            v = struct.unpack("<I", c[80:84])[0]
             rr_prev[gi] = -1 if v == 0xFFFFFFFF else v
+            cycle[gi] = c[90]
 
         # Group each zone's group by MIDI note; each key must be a valid chain.
         by_note = {}
         for _t, _i, _n, c in zone_blocks:
             note = c[1]
-            gidx = struct.unpack(">I", c[88:92])[0]
+            gidx = struct.unpack("<I", c[88:92])[0]
             by_note.setdefault(note, []).append(gidx)
         # key 0->MIDI 36 (3 samples), 5->41 (2), 7->43 (1)
         assert sorted(by_note) == [36, 41, 43]
@@ -195,10 +209,15 @@ def test_exs_round_robin():
             assert rr_prev[gs[0]] == -1, f"note {note} head not -1"
             for j in range(1, len(gs)):
                 assert rr_prev[gs[j]] == gs[j - 1], f"note {note} broken chain"
+            # Multi-sample keys must CYCLE (flag 1); the lone single-sample key
+            # (MIDI 43) must not — a cycle flag on a 1-group chain gates itself.
+            want = 1 if len(gs) > 1 else 0
+            for g in gs:
+                assert cycle[g] == want, f"note {note} wrong cycle flag"
 
         kit_dir = exs_path.parent
         for _t, _i, _n, c in samples:
-            fname = c[336:592].split(b"\x00", 1)[0].decode("ascii")
+            fname = c[336:600].split(b"\x00", 1)[0].decode("ascii")
             assert (kit_dir / fname).exists()
 
 

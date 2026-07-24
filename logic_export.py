@@ -158,164 +158,109 @@ def _unique(base: str, used: set[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# EXS24 binary writer
+# EXS24 binary writer — modern little-endian ("TBOS") format
+#
+# Rewritten 2026-07-24 to match Logic's own factory kits byte-for-byte (see
+# exs_templates.py for how the templates were extracted). The previous writer
+# emitted the old big-endian "SOBT" layout with an all-zero PARAMS block; Logic
+# read that as 0 global voices, so every note stole the single voice and the
+# whole kit gated ("drums cut each other off"). The modern format carries a
+# populated PARAMS block (16 voices) plus per-group polyphonic options, which
+# together stop the gating. Round-robin uses the group "previous-group" link
+# (offset 80) + cycle flag (offset 90), same mechanism as before but little-endian.
 # ---------------------------------------------------------------------------
 
-_MAGIC = b"SOBT"                 # big-endian block magic
+import exs_templates as _T
+
+_MAGIC = b"TBOS"                 # little-endian block magic
 _TYPE_INSTRUMENT = 0x00
 _TYPE_ZONE = 0x01
 _TYPE_GROUP = 0x02
 _TYPE_SAMPLE = 0x03
 _TYPE_PARAMS = 0x04
+_TYPE_OUTPUT = 0x08              # the six cosmetic "output" blocks
 
 
-def _u32(v: int) -> bytes:
-    return struct.pack(">I", v & 0xFFFFFFFF)
-
-
-def _u16(v: int) -> bytes:
-    return struct.pack(">H", v & 0xFFFF)
-
-
-def _s8(v: int) -> bytes:
-    return struct.pack(">B", v & 0xFF)          # two's-complement in one byte
+def _le32(v: int) -> bytes:
+    return struct.pack("<I", v & 0xFFFFFFFF)
 
 
 def _ascii(s: str, size: int) -> bytes:
-    raw = s.encode("ascii", "replace")[:size]
+    raw = s.encode("ascii", "replace")[:size - 1]     # keep a NUL terminator
     return raw + b"\x00" * (size - len(raw))
 
 
+def _put(buf: bytearray, off: int, data: bytes) -> None:
+    buf[off:off + len(data)] = data
+
+
 def _block(block_type: int, index: int, name: str, content: bytes) -> bytes:
-    """84-byte block header + content (big-endian, per ConvertWithMoss)."""
-    head = bytes((0, 1, 0, block_type & 0xFF))   # BE flag, version 1.0, type
-    head += _u32(len(content)) + _u32(index) + _u32(0) + _MAGIC
+    """84-byte block header + content, little-endian.
+
+    Modern EXS marks the header type byte with 0x40; magic is "TBOS" (SOBT
+    reversed), byte0 = 1 (little-endian flag)."""
+    head = bytes((1, 1, 0, (block_type & 0x3F) | 0x40))
+    head += _le32(len(content)) + _le32(index) + _le32(0) + _MAGIC
     head += _ascii(name, 64)
     return head + content
 
 
-def _instrument_content(n_zones: int, n_groups: int, n_samples: int,
-                        n_params: int) -> bytes:
-    return (_u32(0) + _u32(n_zones) + _u32(n_groups) + _u32(n_samples)
-            + _u32(n_params) + _u32(0) * 5)
+def _instrument_content(n_zones: int, n_groups: int, n_samples: int) -> bytes:
+    b = bytearray(_T.INSTR_TMPL)
+    _put(b, 4, _le32(n_zones))
+    _put(b, 8, _le32(n_groups))
+    _put(b, 12, _le32(n_samples))
+    _put(b, 16, _le32(1))            # one params block
+    _put(b, 28, _le32(0))            # no per-zone T7 articulation blocks
+    _put(b, 32, _le32(len(_T.T8_NAMES)))
+    _put(b, 40, _le32(0))            # no trailing bplist state block
+    return bytes(b)
 
 
 def _zone_content(z: ZoneSpec, sample_index: int, group_index: int,
                   length: int) -> bytes:
-    pitch = True                                 # pitch tracking on (harmless: single key)
-    opts = (1 if z.one_shot else 0) | (0 if pitch else 2) | 8   # bit3 velRangeOn
-    b = bytearray()
-    b += _s8(opts)
-    b += _s8(int(np.clip(z.midi_note, 0, 127)))  # root key
-    b += _s8(0)                                  # fine tuning
-    b += _s8(0)                                  # pan
-    b += _s8(0)                                  # volume adjust (dB)
-    b += _s8(0)                                  # volume scale
-    b += _s8(int(np.clip(z.midi_note, 0, 127)))  # key low
-    b += _s8(int(np.clip(z.midi_note, 0, 127)))  # key high
-    b += b"\x00"                                 # pad
-    b += _s8(int(np.clip(z.vel_low, 1, 127)))
-    b += _s8(int(np.clip(z.vel_high, 1, 127)))
-    b += b"\x00"                                 # pad
-    b += _u32(0)                                 # sample start
-    b += _u32(max(0, length))                    # sample end (whole sample)
-    b += _u32(0)                                 # loop start
-    b += _u32(0)                                 # loop end
-    b += _u32(0)                                 # loop crossfade
-    b += _s8(0)                                  # loop tune
-    b += _s8(0)                                  # loop options (loop off)
-    b += _s8(0)                                  # loop direction
-    b += b"\x00" * 42
-    b += _s8(0)                                  # flex options
-    b += _s8(0)                                  # flex speed
-    b += _s8(0)                                  # tail tune
-    b += _s8(0)                                  # coarse tuning
-    b += b"\x00"                                 # pad
-    b += _s8(0)                                  # output
-    b += b"\x00" * 5
-    b += _u32(group_index)                       # group index (-1 if none)
-    b += _u32(sample_index)
+    b = bytearray(_T.ZONE_TMPL)     # a known-good full-range one-shot zone
+    root = int(np.clip(z.midi_note, 0, 127))
+    b[1] = root                     # root key
+    b[4] = 0                         # neutral fine-tune (template carries a per-sample offset)
+    b[6] = root                     # key low
+    b[7] = root                     # key high
+    b[9] = int(np.clip(z.vel_low, 0, 127))
+    b[10] = int(np.clip(z.vel_high, 1, 127))
+    _put(b, 16, _le32(max(0, length)))   # sample end (frames)
+    _put(b, 24, _le32(max(0, length)))
+    _put(b, 88, _le32(group_index))
+    _put(b, 92, _le32(sample_index))
     return bytes(b)
 
 
 def _group_content(rr_prev: int = -1, round_robin: bool = False) -> bytes:
-    """Group block. `rr_prev` = index of the PREVIOUS group in this group's
-    round-robin chain (the EXS24 linked-list encoding Logic actually honors, at
-    offset 80); -1 marks a chain head / no round-robin. A key's groups form one
-    chain (head=-1, each next → prior group's index) so Logic cycles them."""
-    b = bytearray()
-    b += _s8(0)          # volume
-    b += _s8(0)          # pan
-    b += _s8(0)          # polyphony (0 = max)
-    b += _s8(1)          # options: bit0 = POLYPHONIC. Every factory drum kit sets
-    #                      this; leaving it 0 makes the group mono, so each hit
-    #                      cuts the previous — "all the drums cut each other off".
-    b += _s8(0)          # exclusive (voice/mute group) — 0 = none in every factory group
-    b += _s8(0)          # min velocity
-    b += _s8(127)        # max velocity
-    b += _s8(0)          # sample-select random offset
-    b += _s8(255)        # (0xFF) — constant in factory drum-kit groups at offset 8
-    b += b"\x00" * 7
-    b += _u16(0)         # release-trigger time
-    b += b"\x00" * 14
-    b += _s8(128)        # velocity range crossfade (+128 bias)
-    b += _s8(0)          # velocity crossfade type
-    b += _s8(0)          # key-range crossfade type
-    b += _s8(128)        # key range crossfade (+128 bias)
-    b += b"\x00" * 2
-    b += _s8(80)         # enable-by-tempo low
-    b += _s8(140)        # enable-by-tempo high
-    b += b"\x00"
-    b += _s8(0)          # cutoff offset
-    b += b"\x00"
-    b += _s8(0)          # reso offset
-    b += b"\x00" * 12
-    b += _u32(0) * 4     # env1 attack/decay/sustain/release offsets
-    b += b"\x00"
-    b += _s8(0)          # release trigger
-    b += _s8(0)          # output
-    b += _s8(0)          # enable-by-note value
-    b += b"\x00" * 4
-    b += _u32(rr_prev if rr_prev >= 0 else 0xFFFFFFFF)  # RR previous-group link (off 80)
-    b += _s8(0)          # enable-by type
-    b += _s8(0)          # enable-by control value
-    b += _s8(0)          # control low
-    b += _s8(0)          # control high (factory drum groups use 0 here)
-    b += _s8(0)          # start note (off 88)
-    b += _s8(127)        # end note (off 89)
-    # off 90: chain-select mode. With a prev-group link (off 80) set, 1 = CYCLE the
-    # chained groups (true round-robin), 0 = MUTE/choke them (plays one, no rotation
-    # — the bug). Factory rotating groups use 1; mute-pairs use 0.
-    b += _s8(1 if round_robin else 0)   # off 90 (round-robin cycle enable)
-    b += _s8(1)          # off 91 — constant 1 in factory groups
+    """Group block from the factory template. Its polyphony byte (offset 2 = 0 =
+    max voices) and options byte (offset 3 = 1 = polyphonic) already prevent
+    per-group choking. For round-robin we set the previous-group link (offset 80)
+    and the cycle flag (offset 90 = 1); a chain head / non-RR group keeps -1 / 0."""
+    b = bytearray(_T.GROUP_TMPL)
+    _put(b, 80, _le32(rr_prev if rr_prev >= 0 else 0xFFFFFFFF))
+    b[90] = 1 if round_robin else 0
     return bytes(b)
 
 
 def _sample_content(length: int, sample_rate: int, bit_depth: int,
-                    file_size: int, wave_data_start: int,
+                    file_size: int, data_start: int, dir_path: str,
                     file_name: str) -> bytes:
-    b = bytearray()
-    b += _u32(wave_data_start)
-    b += _u32(length)
-    b += _u32(sample_rate)
-    b += _u32(bit_depth)
-    b += _u32(1)                 # channels
-    b += _u32(1)                 # channels 2
-    b += b"\x00" * 4
-    b += _ascii("WAVE", 4)       # type (big-endian)
-    b += _u32(file_size)
-    b += _u32(0)                 # not compressed
-    b += b"\x00" * 40
-    b += _ascii("", 256)         # file path (empty -> same folder as .exs)
-    b += _ascii(file_name, 256)
+    b = bytearray(_T.SAMPLE_TMPL)
+    _put(b, 0, _le32(data_start))       # byte offset of PCM data in the WAV
+    _put(b, 4, _le32(length))           # frames
+    _put(b, 8, _le32(sample_rate))
+    _put(b, 12, _le32(bit_depth))
+    _put(b, 16, _le32(1))               # channels (mono)
+    _put(b, 20, _le32(1))
+    _put(b, 24, _le32(1))
+    _put(b, 28, b"EVAW")                # "WAVE" 4cc, byte-reversed for LE
+    _put(b, 32, _le32(file_size))
+    _put(b, 80, _ascii(dir_path, 256))  # absolute directory holding the WAV
+    _put(b, 336, _ascii(file_name, 264))
     return bytes(b)
-
-
-def _params_content() -> bytes:
-    # Exact byte layout ConvertWithMoss emits for the default/empty parameter
-    # set: 100 "old" slots then 200 "new" slots, all zero -> Sampler defaults.
-    return (_u32(100) + b"\x00" * (100 + 1000)
-            + _u32(200) + b"\x00" * 400)
 
 
 def _wav_data_offset(path: Path) -> int:
@@ -359,8 +304,9 @@ def write_exs_kit(
         raise ValueError("nothing to export — the kit has no samples")
 
     safe_kit = sanitize_name(kit_name)
-    kit_dir = Path(dest_dir)              # write flat here, no <KitName>/ subfolder
+    kit_dir = Path(dest_dir).resolve()   # write flat here, no <KitName>/ subfolder
     kit_dir.mkdir(parents=True, exist_ok=True)
+    dir_path = str(kit_dir)              # absolute path stored in each sample block
 
     bit_depth = 24
     subtype = "PCM_24"
@@ -381,7 +327,7 @@ def write_exs_kit(
         sample_of_zone.append(si)
 
     # 2) Write the unique WAVs and gather per-sample metadata.
-    sample_meta = []  # (length, file_size, wave_data_start, file_name)
+    sample_meta = []  # (length, file_size, data_start, file_name)
     total = len(unique_zones)
     for si, z in enumerate(unique_zones):
         if progress:
@@ -418,11 +364,11 @@ def write_exs_kit(
         for j in range(1, len(ordered)):
             rr_prev[ordered[j]] = ordered[j - 1]
 
-    # 4) Assemble the EXS blocks: instrument, zones, groups, samples, params.
+    # 4) Assemble the EXS blocks in file order: instrument, zones, groups,
+    #    samples, params, then the six cosmetic output blocks.
     out = bytearray()
     out += _block(_TYPE_INSTRUMENT, 0, safe_kit,
-                  _instrument_content(len(zones), n_groups,
-                                      len(unique_zones), 1))
+                  _instrument_content(len(zones), n_groups, len(unique_zones)))
     for i, z in enumerate(zones):
         length = sample_meta[sample_of_zone[i]][0]
         out += _block(_TYPE_ZONE, i, z.name,
@@ -435,8 +381,10 @@ def write_exs_kit(
         length, file_size, data_start, file_name = sample_meta[si]
         out += _block(_TYPE_SAMPLE, si, z.name,
                       _sample_content(length, int(sample_rate), bit_depth,
-                                      file_size, data_start, file_name))
-    out += _block(_TYPE_PARAMS, 0, safe_kit, _params_content())
+                                      file_size, data_start, dir_path, file_name))
+    out += _block(_TYPE_PARAMS, 0, "Default Param", bytes(_T.PARAMS_TMPL))
+    for oi, oname in enumerate(_T.T8_NAMES):
+        out += _block(_TYPE_OUTPUT, oi, oname, _T.T8_CONTENT)
 
     exs_path = kit_dir / f"{safe_kit}.exs"
     exs_path.write_bytes(bytes(out))
