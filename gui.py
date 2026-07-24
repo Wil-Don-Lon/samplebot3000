@@ -25,8 +25,8 @@ from PySide6.QtWidgets import (
 )
 
 from pipeline import (
-    run_pipeline, assign_keys_to_clusters, Instrument, NOTE_NAMES,
-    NOTE_NAMES_12, MAX_KEYS, KEY_CAP_LABEL,
+    run_pipeline, assign_keys_to_clusters, build_instrument_drumkeys_gm,
+    Instrument, NOTE_NAMES, NOTE_NAMES_12, MAX_KEYS, KEY_CAP_LABEL,
 )
 from audio_engine import AudioEngine
 from piano_widget import PianoKeyboardWidget
@@ -512,6 +512,9 @@ class MainWindow(QMainWindow):
         #   "random"   → a random sample from the cluster fires on each hit.
         #   "velocity" → the velocity slider picks the layer (soft→loud by rms).
         self._sample_mode: str = "random"
+        # Cluster→key sort mode: "frequency" (pitch-ordered) | "auto" (autosorter,
+        # GM keys). Default frequency (matches the old PITCH-SORT-on default).
+        self._sort_mode: str = "frequency"
         # When False (default), envelope + filter edits apply to the whole cluster
         # (every sample on the selected key); when True, only the active sample.
         self._per_sample_edit: bool = False
@@ -776,19 +779,17 @@ class MainWindow(QMainWindow):
         clip_row.addStretch(1)
         col.addLayout(clip_row)
 
-        # CLAP-SORT (Stage 2): after clustering, label each cluster with CLAP +
-        # pitch/brightness cues and drop it on the matching drum key. Off = keep
-        # the raw pitch-ordered cluster-per-key layout. A toggle at the bottom of
-        # the analysis controls (was a dropdown up top).
-        clap_row = QHBoxLayout()
-        clap_lbl = QLabel("CLAP SORT")
-        clap_lbl.setObjectName("controlLabel")
-        clap_lbl.setMinimumWidth(110)
-        self.clap_check = ToggleSwitch()
-        clap_row.addWidget(clap_lbl)
-        clap_row.addWidget(self.clap_check)
-        clap_row.addStretch(1)
-        col.addLayout(clap_row)
+        # SORT mode: how finished clusters map to keys.
+        #  FREQUENCY = order clusters by pitch onto the keyboard (raw, no labels).
+        #  AUTO      = the auto-sorter labels each cluster and drops it on its GM
+        #              key, one cluster per key.
+        sort_row = QHBoxLayout()
+        sort_lbl = QLabel("SORT")
+        sort_lbl.setObjectName("controlLabel")
+        sort_lbl.setMinimumWidth(110)
+        sort_row.addWidget(sort_lbl)
+        sort_row.addWidget(self._make_sort_mode_toggle(), 1)
+        col.addLayout(sort_row)
 
         # Progress + status
         col.addWidget(self._progress_bar())
@@ -833,6 +834,30 @@ class MainWindow(QMainWindow):
         self.btn_vellayer.clicked.connect(lambda: self._set_sample_mode("velocity"))
         h.addWidget(self.btn_random, 1)
         h.addWidget(self.btn_vellayer, 1)
+        return w
+
+    def _make_sort_mode_toggle(self) -> QWidget:
+        """Segmented FREQUENCY | AUTO switch for cluster→key sorting."""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        self.btn_freq = QPushButton("FREQUENCY")
+        self.btn_freq.setObjectName("toggleLeft")
+        self.btn_freq.setCheckable(True)
+        self.btn_freq.setChecked(self._sort_mode == "frequency")
+        self.btn_auto = QPushButton("AUTO")
+        self.btn_auto.setObjectName("toggleRight")
+        self.btn_auto.setCheckable(True)
+        self.btn_auto.setChecked(self._sort_mode == "auto")
+        grp = QButtonGroup(w)
+        grp.setExclusive(True)
+        grp.addButton(self.btn_freq)
+        grp.addButton(self.btn_auto)
+        self.btn_freq.clicked.connect(lambda: self._set_sort_mode("frequency"))
+        self.btn_auto.clicked.connect(lambda: self._set_sort_mode("auto"))
+        h.addWidget(self.btn_freq, 1)
+        h.addWidget(self.btn_auto, 1)
         return w
 
     def _make_hdbscan_row(self) -> QWidget:
@@ -939,17 +964,6 @@ class MainWindow(QMainWindow):
         smode_row.addWidget(smode_label)
         smode_row.addWidget(self._make_sample_mode_toggle(), 1)
         col.addLayout(smode_row)
-
-        # Pitch sort: assign clusters to keys by dominant frequency
-        sort_row = QHBoxLayout()
-        sort_label = QLabel("PITCH SORT")
-        sort_label.setObjectName("controlLabel")
-        sort_label.setMinimumWidth(110)
-        self.sort_check = ToggleSwitch(checked=True)
-        self.sort_check.toggled.connect(self._on_sort_toggled)
-        sort_row.addWidget(sort_label)
-        sort_row.addWidget(self.sort_check, 1)
-        col.addLayout(sort_row)
 
         # Equal loudness: A-weighted (Fletcher-Munson) perceived-loudness
         # normalization — tames bright/harsh samples so the whole kit sits at
@@ -1177,14 +1191,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.status.setText("starting…")
 
-        # Cluster-first flow only. Stage 1 = HDBSCAN clustering; Stage 2 =
-        # optional CLAP-sort of the finished clusters onto drum keys.
+        # Cluster-first flow only. Stage 1 = HDBSCAN clustering; Stage 2 = the
+        # AUTO sorter drops finished clusters onto GM keys (FREQUENCY skips it).
         mode = "hdbscan"   # the only clustering model
-        clap_sort = self.clap_check.isChecked()
-        # CLAP-sorted results use the fixed GM drum layout, which PITCH SORT never
-        # re-sorts, so disable that control there.
-        self._result_is_classify = clap_sort
-        self.sort_check.setEnabled(not clap_sort)
+        clap_sort = self._sort_mode == "auto"
+        self._result_is_classify = clap_sort   # AUTO → fixed GM layout + cap labels
 
         # HDBSCAN diversity is a float (tenths): int part = min_cluster_size,
         # fractional part feeds a small merge epsilon downstream.
@@ -1310,7 +1321,6 @@ class MainWindow(QMainWindow):
         self._update_sample_selector()
         self.step_grid.setActive(False)
         self.step_grid.setPattern([False] * N_STEPS)
-        self.sort_check.setEnabled(not self._result_is_classify)
         self._refresh_octave_view()
         loaded = bool(self._instrument.loaded_notes())
         self._enable_instrument_actions(loaded)
@@ -1562,20 +1572,31 @@ class MainWindow(QMainWindow):
         db = self._trim_db_from_slider(v)
         self.trim_value_lbl.setText(f"{db:.0f} dB")
 
-    @Slot(bool)
-    def _on_sort_toggled(self, checked: bool) -> None:
-        if not self._all_segments or self._result_is_classify:
-            # Classification uses a fixed GM drum layout — never re-sort it.
+    def _set_sort_mode(self, mode: str) -> None:
+        """Switch cluster→key sorting. FREQUENCY re-sorts live (cheap). AUTO
+        re-applies the GM one-per-key placement if the clusters were already
+        auto-sorted (labels present); otherwise it just sets the mode for the next
+        RUN (the auto-sorter needs a fresh pass to label clusters)."""
+        self._sort_mode = mode
+        if not self._all_segments:
             return
-        # Cluster->key mapping is about to change, so release anything held.
+        # Cluster→key mapping is about to change — release anything held.
         for n in list(self.piano._pressed):  # type: ignore[attr-defined]
-            cluster_idx = n + self._octave * OCTAVE_STEP
-            self._engine.release_note(cluster_idx)
+            self._engine.release_note(n + self._octave * OCTAVE_STEP)
             self.piano.release_note(n)
-        self._instrument = assign_keys_to_clusters(
-            self._all_segments, sort_by_freq=checked
-        )
+        if mode == "frequency":
+            self._instrument = assign_keys_to_clusters(
+                self._all_segments, sort_by_freq=True)
+            self._result_is_classify = False
+        else:  # auto
+            if any(getattr(s, "label", "") for s in self._all_segments):
+                self._instrument = build_instrument_drumkeys_gm(self._all_segments)
+                self._result_is_classify = True
+            else:
+                self.status.setText("AUTO sort — press RUN ANALYSIS to auto-sort onto GM keys.")
+                return
         self._octave = 0
+        self._apply_loudness_gains()
         self._refresh_octave_view()
 
     def _sync_adsr_to_engine(self) -> None:
@@ -1615,11 +1636,12 @@ class MainWindow(QMainWindow):
             if base <= ci <= base + N_VISIBLE_KEYS - 1
         }
         self.piano.set_loaded(loaded_in_octave)
-        # In classification mode each loaded key shows its fixed drum-layout cap
-        # (KICK, SNR1, HH2, …). Clustering mode shows no labels.
+        # In AUTO-sort mode each loaded key shows its GM cap (KICK, SNR, HH-C, …).
+        # The visible index n maps to the ABSOLUTE GM key n+base for its label, so
+        # higher-octave keys (e.g. BELL/RIDE2) label correctly. Freq-sort: no labels.
         if self._result_is_classify:
-            key_labels = {n: KEY_CAP_LABEL[n] for n in loaded_in_octave
-                          if n in KEY_CAP_LABEL}
+            key_labels = {n: KEY_CAP_LABEL[n + base] for n in loaded_in_octave
+                          if (n + base) in KEY_CAP_LABEL}
         else:
             key_labels = {}
         self.piano.set_key_labels(key_labels)
@@ -1696,9 +1718,9 @@ class MainWindow(QMainWindow):
         sample-selector, load the active sample's settings, show its pattern."""
         self._selected_key = cluster_idx
         self.piano.set_selected(note_index)
-        # The drum layout is a single fixed octave, so the visible key index
-        # (0..16) is the cap-label key.
-        cap = KEY_CAP_LABEL.get(note_index, f"KEY {cluster_idx}")
+        # Cap label comes from the ABSOLUTE GM key index (spans octaves), not the
+        # visible index — so a selected BELL/RIDE2 in a higher octave labels right.
+        cap = KEY_CAP_LABEL.get(cluster_idx, f"KEY {cluster_idx + 1}")
         self.active_led.setOn(True)
         self.active_lbl.setText(cap)
         self._update_sample_selector()

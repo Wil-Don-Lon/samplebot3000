@@ -763,34 +763,54 @@ def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int,
     return segments
 
 
-# Fixed drum-machine keyboard layout across one visible octave (17 keys, C..E).
-# (key_index, class, cap label). Classes with several keys (snare, hats, fx)
-# get their samples spread round-robin across those keys for variety.
+# Industry-standard General MIDI drum map. key_index == MIDI note - BASE_MIDI_NOTE
+# (36), so keys 0..23 == C1..B2, and both the Logic/EXS export (36 + key) and MIDI
+# input (note - 36) land on the correct GM notes. (family, cap label). A family
+# with several keys is spread across them one-cluster-per-key by an acoustic cue
+# (toms by pitch, hats by openness, cymbals by brightness) — see
+# build_instrument_drumkeys_gm; the CLASS_KEYS order below is the spread order.
 DRUM_KEYMAP: list[tuple[int, str, str]] = [
-    (0,  "kick",   "KICK"),
-    (1,  "snare",  "SNR1"),
-    (2,  "snare",  "SNR2"),
-    (3,  "clap",   "CLAP"),
-    (4,  "snare",  "SNR3"),
-    (5,  "lotom",  "LO-T"),
-    (6,  "hats",   "HH1"),
-    (7,  "midtom", "MID-T"),
-    (8,  "hats",   "HH2"),
-    (9,  "hitom",  "HI-T"),
-    (10, "hats",   "HH3"),
-    (11, "fx",     "FX1"),
-    (12, "fx",     "FX2"),
-    (13, "crash",  "CRASH"),
-    (14, "fx",     "FX3"),
-    (15, "ride",   "RIDE"),
-    (16, "fx",     "FX4"),
+    (0,  "kick",        "KICK"),   # 36 C1  Bass Drum
+    (1,  "side_stick",  "STIX"),   # 37 C#1 Side Stick / rim knock
+    (2,  "snare",       "SNR"),    # 38 D1  Acoustic Snare
+    (3,  "clap",        "CLAP"),   # 39 D#1 Hand Clap
+    (4,  "snare",       "SNR2"),   # 40 E1  Electric Snare / rimshot
+    (5,  "tom",         "TOM1"),   # 41 F1  Low Floor Tom  (lowest)
+    (6,  "hat",         "HH-C"),   # 42 F#1 Closed Hi-Hat
+    (7,  "tom",         "TOM2"),   # 43 G1  High Floor Tom
+    (8,  "hat",         "HH-P"),   # 44 G#1 Pedal Hi-Hat
+    (9,  "tom",         "TOM3"),   # 45 A1  Low Tom
+    (10, "hat",         "HH-O"),   # 46 A#1 Open Hi-Hat
+    (11, "tom",         "TOM4"),   # 47 B1  Low-Mid Tom
+    (12, "tom",         "TOM5"),   # 48 C2  Hi-Mid Tom
+    (13, "crash",       "CRSH"),   # 49 C#2 Crash 1
+    (14, "tom",         "TOM6"),   # 50 D2  High Tom   (highest)
+    (15, "ride",        "RIDE"),   # 51 D#2 Ride 1
+    (16, "crash",       "CHINA"),  # 52 E2  Chinese Cymbal
+    (17, "ride",        "BELL"),   # 53 F2  Ride Bell
+    (18, "tambourine",  "TAMB"),   # 54 F#2 Tambourine
+    (19, "crash",       "SPLSH"),  # 55 G2  Splash Cymbal
+    (20, "cowbell",     "COW"),    # 56 G#2 Cowbell
+    (21, "crash",       "CRSH2"),  # 57 A2  Crash 2
+    (22, "fx",          "FX"),     # 58 A#2 Vibraslap / aux
+    (23, "ride",        "RIDE2"),  # 59 B2  Ride 2
 ]
-# class -> ordered list of key indices it occupies
+# family -> ordered list of key indices it occupies (order == within-family spread order)
 CLASS_KEYS: dict[str, list[int]] = {}
 for _k, _c, _lab in DRUM_KEYMAP:
     CLASS_KEYS.setdefault(_c, []).append(_k)
 # key index -> cap label, for the GUI
 KEY_CAP_LABEL: dict[int, str] = {k: lab for k, _c, lab in DRUM_KEYMAP}
+
+# Map the CLAP-sort's leaf labels (and any classifier leaves) onto GM families,
+# so the one-per-key placement can spread them across the GM key slots.
+LEAF_TO_GM_FAMILY: dict[str, str] = {
+    "kick": "kick", "snare": "snare", "clap": "clap", "hats": "hat",
+    "lotom": "tom", "midtom": "tom", "hitom": "tom", "tom": "tom",
+    "crash": "crash", "ride": "ride", "rim": "side_stick",
+    "side_stick": "side_stick", "cowbell": "cowbell", "tambourine": "tambourine",
+    "fx": "fx",
+}
 
 
 def classify_feature_matrix(segments: list[Segment], feature_type: str) -> np.ndarray:
@@ -1045,6 +1065,73 @@ def build_instrument_drumkeys_by_cluster(
     return inst
 
 
+def _cluster_family(segs: list[Segment]) -> str:
+    """GM family for a whole cluster, from its (shared) leaf label."""
+    leaf = segs[0].label if getattr(segs[0], "label", "") else ""
+    return LEAF_TO_GM_FAMILY.get(leaf, leaf if leaf in CLASS_KEYS else "fx")
+
+
+def _within_family_cue(family: str, segs: list[Segment]) -> float:
+    """Sort key for spreading a family's clusters across its GM keys (ascending):
+    toms low→high by pitch, hats closed→open by high-frequency content, everything
+    else biggest-cluster-first (main hit claims the primary slot)."""
+    if family == "tom":
+        vals = [low_band_f0(s.audio) for s in segs]
+        vals = [v for v in vals if v > 0]
+        return float(np.median(vals)) if vals else 0.0
+    if family == "hat":
+        return float(np.median([s.features[ROLLOFF_MEAN_INDEX] for s in segs]))
+    return -float(len(segs))
+
+
+def build_instrument_drumkeys_gm(
+    segments: list[Segment], n_keys: int = MAX_KEYS) -> Instrument:
+    """Place whole clusters onto the GM keyboard — ONE cluster per key, never
+    stacked. Each cluster's leaf label picks its GM family; the family's clusters
+    spread across that family's GM keys by an acoustic cue (toms by pitch, hats by
+    openness, cymbals by size). If a family has more clusters than keys they spill
+    to the next free GM key; anything that can't be placed (and all outliers) goes
+    to `unassigned` for manual sorting."""
+    if not segments:
+        return Instrument()
+    clusters: dict[int, list[Segment]] = {}
+    for s in segments:
+        if s.cluster == OUTLIER_CLUSTER:
+            continue
+        clusters.setdefault(s.cluster, []).append(s)
+
+    by_family: dict[str, list[list[Segment]]] = {}
+    for segs in clusters.values():
+        by_family.setdefault(_cluster_family(segs), []).append(segs)
+
+    all_keys = [k for k, _c, _l in DRUM_KEYMAP]
+    taken: set[int] = set()
+    inst = Instrument()
+    overflow: list[Segment] = []
+
+    def place(key: int, segs: list[Segment]) -> None:
+        taken.add(key)
+        for s in segs:
+            s.cluster = key
+        if 0 <= key < n_keys:
+            inst.notes[key] = sorted(segs, key=lambda s: s.rms)
+
+    for family, clist in by_family.items():
+        clist = sorted(clist, key=lambda segs: _within_family_cue(family, segs))
+        fam_keys = CLASS_KEYS.get(family, [])
+        for segs in clist:
+            free = [k for k in fam_keys if k not in taken] or \
+                   [k for k in all_keys if k not in taken]
+            if free:
+                place(free[0], segs)
+            else:
+                overflow.extend(segs)   # kit full — send to unassigned
+
+    outliers = [s for s in segments if s.cluster == OUTLIER_CLUSTER]
+    inst.unassigned = sorted(outliers + overflow, key=lambda s: s.rms)
+    return inst
+
+
 def build_instrument_drumkeys(segments: list[Segment], n_keys: int = MAX_KEYS) -> Instrument:
     """Lay predicted segments onto the fixed drum keyboard. Each class's samples
     are distributed round-robin across the key(s) assigned to that class (e.g.
@@ -1218,8 +1305,8 @@ def run_pipeline(
     if mode == "classify":
         instrument = build_instrument_drumkeys(segments, n_keys=n_keys)
     elif cluster_info is not None:
-        # CLAP-sorted clusters land whole on their labeled drum keys.
-        instrument = build_instrument_drumkeys_by_cluster(segments, n_keys=n_keys)
+        # Auto-sorted clusters land ONE-PER-KEY on the GM layout by family.
+        instrument = build_instrument_drumkeys_gm(segments, n_keys=n_keys)
     else:
         instrument = build_instrument(segments, n_keys=n_keys)
     n_loaded = len(instrument.loaded_notes())

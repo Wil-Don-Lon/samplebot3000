@@ -19,13 +19,15 @@ from typing import Callable, Optional
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QCursor
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QListWidget, QListWidgetItem, QAbstractItemView, QWidget,
 )
 
 from pipeline import (
     Instrument, Segment, NOTE_NAMES_12, KEY_CAP_LABEL, TARGET_SR, OUTLIER_CLUSTER,
+    MAX_KEYS,
 )
+from logic_export import BASE_MIDI_NOTE
 from audio_engine import AudioEngine
 
 _REMOVE_KEY = -1                 # header sentinel: samples under it are dropped
@@ -215,6 +217,23 @@ class RecategorizeDialog(QDialog):
         root.addWidget(self.list, 1)
         self._after_move()   # stamp initial header counts
 
+        # Manual override: select sample(s) — even across clusters — and drop them
+        # onto a specific key (any GM key, across all octaves), for when the
+        # auto-sorter is wrong. Complements the drag-and-drop.
+        assign_row = QHBoxLayout()
+        assign_lbl = QLabel("Assign selected to key:")
+        assign_lbl.setObjectName("dialogSubtle")
+        self.key_combo = QComboBox()
+        for k in range(MAX_KEYS):
+            self.key_combo.addItem(self._key_option_label(k), k)
+        assign_btn = QPushButton("ASSIGN →")
+        assign_btn.clicked.connect(
+            lambda: self._assign_selected_to_key(self.key_combo.currentData()))
+        assign_row.addWidget(assign_lbl)
+        assign_row.addWidget(self.key_combo, 1)
+        assign_row.addWidget(assign_btn)
+        root.addLayout(assign_row)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         cancel_btn = QPushButton("CANCEL")
@@ -290,6 +309,49 @@ class RecategorizeDialog(QDialog):
         seg = self._by_id.get(item.data(_DATA_ROLE))
         if seg is not None:
             self._engine.play(seg.audio, gain=self._get_gain(), note_id=-1)
+
+    def _key_option_label(self, key: int) -> str:
+        """Human label for the assign-to-key picker: note+octave and GM cap."""
+        note = NOTE_NAMES_12[key % 12]
+        octave = key // 12
+        suffix = f"+{octave}" if octave else ""
+        cap = KEY_CAP_LABEL.get(key, "")
+        return f"{note}{suffix}   {cap}".rstrip()
+
+    def _header_row_for(self, key: int) -> Optional[int]:
+        for r in range(self.list.count()):
+            it = self.list.item(r)
+            if it.data(_KIND_ROLE) == "header" and it.data(_DATA_ROLE) == key:
+                return r
+        return None
+
+    def _assign_selected_to_key(self, key: int) -> None:
+        """Move the currently-selected sample(s) onto `key`, creating that key's
+        header if it isn't shown yet. The explicit alternative to dragging."""
+        if key is None:
+            return
+        sids = [it.data(_DATA_ROLE) for it in self.list.selectedItems()
+                if it.data(_KIND_ROLE) == "sample"]
+        if not sids:
+            return
+        # Remove the selected sample rows (bottom-up so indices stay valid).
+        for r in range(self.list.count() - 1, -1, -1):
+            it = self.list.item(r)
+            if it.data(_KIND_ROLE) == "sample" and it.data(_DATA_ROLE) in sids:
+                self.list.takeItem(r)
+        hdr_row = self._header_row_for(key)
+        if hdr_row is None:
+            # Insert a fresh header just before the UNASSIGNED divider.
+            insert = self._header_row_for(_UNASSIGNED_KEY)
+            if insert is None:
+                insert = self.list.count()
+            self.list.insertItem(insert, self._make_header(key, self._key_label(key)))
+            hdr_row = insert
+        at = hdr_row + 1
+        for sid in sids:
+            self.list.insertItem(at, self._make_sample(sid))
+            at += 1
+        self._after_move()
 
     def _on_apply(self) -> None:
         new_notes: dict[int, list[Segment]] = {}
