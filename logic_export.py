@@ -76,13 +76,18 @@ def instrument_to_zonespecs(
       Logic's own factory kits encode it (verified against several). The
       Logic-side stand-in for the app's RANDOM mode.
 
-    Each KEY gets its own group (like Logic's factory kits, which always split a
-    kit across several groups — never one). Round-robin needs no group
-    "previous-group" chain and no per-sample groups: within a key's group, its
-    full-velocity zones overlap and Logic auto-cycles them. Chaining groups (an
-    earlier attempt) made Logic steal one voice across the chain — gating, and
-    only one sample ever sounding while the display cycled; a single kit-wide
-    group (a later attempt) left most keys silent in Logic.
+    Both layouts split the kit across several clean groups (factory kits always
+    use several — one kit-wide group left most keys silent in Logic; a group
+    chain stole voices → gating). Grouping differs by mode:
+
+    - velocity split: one group per KEY. A key's velocity layers don't overlap,
+      so they coexist in one group and the incoming velocity picks one.
+    - round robin: one group per RR POSITION — the i-th sample of every key goes
+      in group i. A key's full-velocity samples thus overlap ACROSS groups, and
+      Logic round-robins overlapping zones ONLY when they sit in different groups
+      (same-group overlap just layers — verified against Deep Crunch / Blowing
+      Speakers). Groups stay clean (no chain), so the rotation is polyphonic and
+      never steals a voice.
     """
     valid: dict[int, list] = {}
     for key in sorted(notes):
@@ -133,14 +138,14 @@ def instrument_to_zonespecs(
                 ))
         return zones
 
-    # Round-robin, matching how Logic's own kits actually encode it: every sample
-    # on a key becomes its own FULL-velocity zone, so a key's samples OVERLAP and
-    # Logic auto-cycles them. The key's zones all sit in that key's group (no
-    # per-sample groups, no chain) — see the docstring for why chaining and a
-    # single shared group both fail.
+    # Round-robin: every sample on a key is a FULL-velocity zone (so a key's
+    # samples overlap), and the i-th sample of every key goes in group i. That
+    # scatters a key's samples across DIFFERENT groups, which is the only way
+    # Logic rotates overlapping same-key zones (same-group overlap layers). Groups
+    # stay clean (no chain), so rotation is polyphonic — matches Deep Crunch etc.
     zones = []
     used = set()
-    for gidx, (key, segs) in enumerate(valid.items()):
+    for key, segs in valid.items():
         label = sanitize_name(key_label(key), f"Key{key}")
         n = len(segs)
         midi_note = int(np.clip(base_note + key, 0, 127))
@@ -149,7 +154,7 @@ def instrument_to_zonespecs(
             zones.append(ZoneSpec(
                 audio=aud(seg), name=_unique(base, used), midi_note=midi_note,
                 vel_low=1, vel_high=127, one_shot=one_shot,
-                group_index=gidx,
+                group_index=i,       # RR position -> its own group (cross-group RR)
             ))
     return zones
 
@@ -360,10 +365,11 @@ def write_exs_kit(
     if progress:
         progress("building instrument", 0.8)
 
-    # 3) One group per key (instrument_to_zonespecs assigns group_index per key).
-    #    Round-robin rides on the overlapping same-key zones inside a group, not on
-    #    group fields, so every group is the factory template verbatim. Name each
-    #    group after its first zone so Logic's group list is readable.
+    # 3) Groups come straight from the zone group_index (per key for velocity
+    #    split, per RR position for round-robin — see instrument_to_zonespecs).
+    #    Every group is the factory template verbatim; round-robin rides on how
+    #    zones are spread across groups, not on group fields. Name each group
+    #    after its first zone so Logic's group list is readable.
     n_groups = max((z.group_index for z in zones), default=0) + 1
     group_names: dict[int, str] = {}
     for z in zones:
