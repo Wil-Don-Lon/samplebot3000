@@ -238,7 +238,7 @@ def _zone_content(z: ZoneSpec, sample_index: int, group_index: int,
     return bytes(b)
 
 
-def _group_content(rr_prev: int = -1) -> bytes:
+def _group_content(rr_prev: int = -1, round_robin: bool = False) -> bytes:
     """Group block. `rr_prev` = index of the PREVIOUS group in this group's
     round-robin chain (the EXS24 linked-list encoding Logic actually honors, at
     offset 80); -1 marks a chain head / no round-robin. A key's groups form one
@@ -281,10 +281,13 @@ def _group_content(rr_prev: int = -1) -> bytes:
     b += _s8(0)          # enable-by control value
     b += _s8(0)          # control low
     b += _s8(0)          # control high (factory drum groups use 0 here)
-    b += _s8(0)          # start note
-    b += _s8(127)        # end note
-    b += _s8(0)          # midi channel
-    b += _s8(0)          # articulation
+    b += _s8(0)          # start note (off 88)
+    b += _s8(127)        # end note (off 89)
+    # off 90: chain-select mode. With a prev-group link (off 80) set, 1 = CYCLE the
+    # chained groups (true round-robin), 0 = MUTE/choke them (plays one, no rotation
+    # — the bug). Factory rotating groups use 1; mute-pairs use 0.
+    b += _s8(1 if round_robin else 0)   # off 90 (round-robin cycle enable)
+    b += _s8(1)          # off 91 — constant 1 in factory groups
     return bytes(b)
 
 
@@ -403,11 +406,15 @@ def write_exs_kit(
     #    later group points to the prior one. Velocity-split has one group → -1.
     n_groups = max((z.group_index for z in zones), default=0) + 1
     rr_prev = [-1] * n_groups
+    is_rr = [False] * n_groups            # groups in a >1-sample chain -> cycle mode
     chains: dict[int, list[int]] = {}
     for z in zones:
         chains.setdefault(z.midi_note, []).append(z.group_index)
     for gidxs in chains.values():
         ordered = sorted(set(gidxs))
+        if len(ordered) > 1:
+            for g in ordered:
+                is_rr[g] = True           # whole chain rotates (incl. the head)
         for j in range(1, len(ordered)):
             rr_prev[ordered[j]] = ordered[j - 1]
 
@@ -423,7 +430,7 @@ def write_exs_kit(
                                     group_index=z.group_index, length=length))
     for gi in range(n_groups):
         out += _block(_TYPE_GROUP, gi, safe_kit,
-                      _group_content(rr_prev=rr_prev[gi]))
+                      _group_content(rr_prev=rr_prev[gi], round_robin=is_rr[gi]))
     for si, z in enumerate(unique_zones):
         length, file_size, data_start, file_name = sample_meta[si]
         out += _block(_TYPE_SAMPLE, si, z.name,
