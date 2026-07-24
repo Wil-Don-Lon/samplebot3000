@@ -84,25 +84,28 @@ def test_exs_roundtrip():
         param_blocks = by_type[lx._TYPE_PARAMS]
         output_blocks = by_type[lx._TYPE_OUTPUT]
 
-        assert len(inst) == 1 and len(group_blocks) == 1 and len(param_blocks) == 1
+        # Two keys -> two groups (one group per key; a kit never uses one group).
+        assert len(inst) == 1 and len(group_blocks) == 2 and len(param_blocks) == 1
         assert len(zone_blocks) == 3 and len(sample_blocks) == 3
         assert len(output_blocks) == 6           # the six factory output blocks
 
         # Instrument declares the right block counts (n_t8 at offset 32).
         ic = inst[0][3]
         n_zones, n_groups, n_samples, n_params = struct.unpack("<IIII", ic[4:20])
-        assert (n_zones, n_groups, n_samples, n_params) == (3, 1, 3, 1)
+        assert (n_zones, n_groups, n_samples, n_params) == (3, 2, 3, 1)
         assert struct.unpack("<I", ic[32:36])[0] == 6
         assert struct.unpack("<I", ic[40:44])[0] == 0    # no trailing bplist
 
-        # The single group must be polyphonic (offset 3 bit0) with max voices
-        # (offset 2 = 0) — the per-group half of the anti-gating fix.
-        gc = group_blocks[0][3]
-        assert gc[2] == 0 and (gc[3] & 1), "group must be polyphonic / max voices"
+        # Every group must be polyphonic (offset 3 bit0), max voices (offset 2 = 0),
+        # and carry no round-robin chain / cycle flag — the anti-gating group shape.
+        for _t, _i, _n, gc in group_blocks:
+            assert gc[2] == 0 and (gc[3] & 1), "group must be polyphonic / max voices"
+            assert struct.unpack("<i", gc[80:84])[0] == -1 and gc[90] == 0
 
         # Zones: verify key mapping, single-key range, velocity split, linkage.
         kit_dir = exs_path.parent
         seen_notes = []
+        note_group = {}
         for btype, index, name, content in zone_blocks:
             assert content[0] & 1, "drum zones must be one-shot"
             key = content[1]
@@ -114,12 +117,15 @@ def test_exs_roundtrip():
             assert 1 <= vel_high <= 127 and vel_low <= vel_high
             group_index = struct.unpack("<I", content[88:92])[0]
             sample_index = struct.unpack("<I", content[92:96])[0]
-            assert group_index == 0
             assert sample_index == index, "zone i must reference sample i"
+            note_group.setdefault(key, set()).add(group_index)
             seen_notes.append(key)
 
         # key 0 -> MIDI 36 (two zones), key 5 -> MIDI 41 (one zone).
         assert sorted(seen_notes) == [36, 36, 41]
+        # Each key's zones share ONE group, and different keys use different groups.
+        assert all(len(g) == 1 for g in note_group.values())
+        assert len({next(iter(g)) for g in note_group.values()}) == 2
 
         # The two zones on note 36 must partition velocity with no gap/overlap.
         note36 = sorted(
@@ -156,10 +162,11 @@ def test_exs_roundtrip():
 
 def test_exs_round_robin():
     # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. Modern round-robin = several
-    # FULL-velocity zones OVERLAPPING on one key, all in the single shared group;
+    # FULL-velocity zones OVERLAPPING on one key, inside THAT key's own group;
     # Logic auto-cycles overlapping zones. NO per-sample groups, NO group chain,
     # NO cycle flag — factory kits leave those unset, and setting them makes Logic
     # steal one voice across the chain (the gating / only-one-sample-plays bug).
+    # One group per key (not one kit-wide group, which left keys silent in Logic).
     notes = {
         0: [_make_seg(0.2), _make_seg(0.05), _make_seg(0.4)],
         5: [_make_seg(0.3), _make_seg(0.1)],
@@ -169,9 +176,9 @@ def test_exs_round_robin():
     zones = lx.instrument_to_zonespecs(
         notes, key_label=lambda k: labels[k], round_robin=True)
 
-    # One zone per sample; every zone full-velocity and in the shared group 0.
+    # One zone per sample; every zone full-velocity; three keys -> group ids 0,1,2.
     assert len(zones) == 6
-    assert all(z.group_index == 0 for z in zones)
+    assert sorted(set(z.group_index for z in zones)) == [0, 1, 2]
     assert all(z.vel_low == 1 and z.vel_high == 127 for z in zones)
 
     with tempfile.TemporaryDirectory() as d:
@@ -185,31 +192,35 @@ def test_exs_round_robin():
         samples = by_type[lx._TYPE_SAMPLE]
         zone_blocks = by_type[lx._TYPE_ZONE]
 
-        # Exactly ONE group for the whole kit; one sample + one zone per sample.
-        assert len(groups) == 1 and len(samples) == 6 and len(zone_blocks) == 6
+        # One group per key (3), one sample + one zone per sample (6 each).
+        assert len(groups) == 3 and len(samples) == 6 and len(zone_blocks) == 6
         ic = by_type[lx._TYPE_INSTRUMENT][0][3]
         n_zones, n_groups, n_samples, _ = struct.unpack("<IIII", ic[4:20])
-        assert (n_zones, n_groups, n_samples) == (6, 1, 6)
+        assert (n_zones, n_groups, n_samples) == (6, 3, 6)
 
-        # The shared group must be a clean factory group: no chain (@80 = -1),
-        # no cycle flag (@90 = 0), polyphonic (@3 bit0), max voices (@2 = 0).
-        gc = groups[0][3]
-        assert struct.unpack("<i", gc[80:84])[0] == -1, "group must not chain"
-        assert gc[90] == 0, "group must not set the cycle flag"
-        assert gc[2] == 0 and (gc[3] & 1), "group must be polyphonic / max voices"
+        # Every group must be a clean factory group: no chain (@80 = -1), no cycle
+        # flag (@90 = 0), polyphonic (@3 bit0), max voices (@2 = 0).
+        for _t, _i, _n, gc in groups:
+            assert struct.unpack("<i", gc[80:84])[0] == -1, "group must not chain"
+            assert gc[90] == 0, "group must not set the cycle flag"
+            assert gc[2] == 0 and (gc[3] & 1), "group must be polyphonic / max voices"
 
         # Each key's samples overlap: several full-velocity zones on one note, all
-        # in group 0, each pointing at a distinct sample.
+        # in THAT key's single group, each pointing at a distinct sample.
         by_note = {}
+        note_group = {}
         for _t, _i, _n, c in zone_blocks:
-            assert struct.unpack("<I", c[88:92])[0] == 0, "all zones share group 0"
             assert c[9] <= 1 and c[10] == 127, "round-robin zones are full-velocity"
+            note_group.setdefault(c[1], set()).add(struct.unpack("<I", c[88:92])[0])
             by_note.setdefault(c[1], []).append(struct.unpack("<I", c[92:96])[0])
         # key 0->MIDI 36 (3 samples), 5->41 (2), 7->43 (1)
         assert sorted(by_note) == [36, 41, 43]
         assert sorted(len(v) for v in by_note.values()) == [1, 2, 3]
         for note, sids in by_note.items():
             assert len(set(sids)) == len(sids), f"note {note} zones reuse a sample"
+        # A key's overlapping zones live in ONE group; keys use distinct groups.
+        assert all(len(g) == 1 for g in note_group.values())
+        assert len({next(iter(g)) for g in note_group.values()}) == 3
 
         kit_dir = exs_path.parent
         for _t, _i, _n, c in samples:

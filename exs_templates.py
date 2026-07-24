@@ -19,9 +19,11 @@ Field offsets (little-endian) used by logic_export.py:
   ZONE (148B):  @0 opts, @1 root key, @6 key low, @7 key high, @9 vel low,
                 @10 vel high, @16 & @24 sample end (frames), @88 group index,
                 @92 sample index, @112 = -1 (constant)
-  GROUP (140B): @2 polyphony (0=max), @3 options (bit0=polyphonic),
-                @80 round-robin previous-group link (-1 = head/none),
-                @90 chain mode (1=cycle/true RR, 0=mute)
+  GROUP (140B): @2 polyphony (0=max), @3 options (bit0=polyphonic). Used
+                verbatim — one group per key. (@80 and @90 are a group-chain
+                mechanism the writer deliberately does NOT use: in the modern
+                format they create voice-stealing, not round-robin. Round-robin
+                comes from overlapping same-key zones, which Logic auto-cycles.)
   SAMPLE(600B): @0 data offset, @4 frames, @8 sample rate, @12 bit depth,
                 @16 channels, @20 channels2, @28 type 4cc (byte-reversed),
                 @32 file size, @80 abs dir path (asciiz), @336 file name (asciiz)
