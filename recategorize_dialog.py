@@ -7,9 +7,16 @@ drop it from the kit. Click a sample once to audition it. A sample's cluster is
 simply whichever header it sits under — Apply walks the list top-to-bottom to
 rebuild the key -> samples mapping.
 
-Self-contained: all drag/drop, selection, and audition wiring live here; the
-host GUI only hands over the instrument, an audio engine, a gain getter, an
-is_classify flag, and a key-label function.
+To move a WHOLE cluster to a different key, each cluster header carries an
+"Assign to Key" button: click it to arm that cluster, then press the computer
+key you want it on (the same A/W/S/E/D… piano layout as the main window, with
+Z/X to drop/raise the octave). Landing on an occupied key SWAPS the two
+clusters. This beats a key picker because it reaches every octave with one
+keystroke and mirrors how you actually play the kit.
+
+Self-contained: all drag/drop, selection, audition, and key-capture wiring live
+here; the host GUI only hands over the instrument, an audio engine, a gain
+getter, an is_classify flag, and a key-label function.
 """
 
 from __future__ import annotations
@@ -17,18 +24,28 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QCursor
+from PySide6.QtGui import QColor, QCursor, QKeyEvent
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QAbstractItemView, QWidget,
 )
 
 from pipeline import (
-    Instrument, Segment, NOTE_NAMES_12, KEY_CAP_LABEL, TARGET_SR, OUTLIER_CLUSTER,
-    MAX_KEYS,
+    Instrument, Segment, KEY_CAP_LABEL, TARGET_SR, OUTLIER_CLUSTER, MAX_KEYS,
 )
-from logic_export import BASE_MIDI_NOTE
 from audio_engine import AudioEngine
+
+# The main window's computer-keyboard → note-index map, copied here because
+# importing it from gui.py would be circular (gui imports this dialog). 17 keys
+# per octave (C … E-of-next); Z/X shift the octave, so key = note + oct*12.
+_KEY_TO_NOTE = {
+    Qt.Key_A: 0,  Qt.Key_W: 1,  Qt.Key_S: 2,  Qt.Key_E: 3,  Qt.Key_D: 4,
+    Qt.Key_F: 5,  Qt.Key_T: 6,  Qt.Key_G: 7,  Qt.Key_Y: 8,  Qt.Key_H: 9,
+    Qt.Key_U: 10, Qt.Key_J: 11, Qt.Key_K: 12, Qt.Key_O: 13, Qt.Key_L: 14,
+    Qt.Key_P: 15, Qt.Key_Semicolon: 16,
+}
+_OCTAVE_STEP = 12
+_MAX_OCTAVE = (MAX_KEYS - 1) // _OCTAVE_STEP
 
 _REMOVE_KEY = -1                 # header sentinel: samples under it are dropped
 _UNASSIGNED_KEY = -2             # header sentinel: samples parked, unexported
@@ -150,6 +167,10 @@ class RecategorizeDialog(QDialog):
         self._key_label = key_label
         self._by_id: dict[int, Segment] = {}     # stable id -> Segment
         self._first_key: Optional[int] = None    # topmost real cluster (Apply fallback)
+        self._hdr_lbl: dict[int, QLabel] = {}    # cluster key -> its header label widget
+        self._hdr_btn: dict[int, QPushButton] = {}   # cluster key -> its "Assign to Key" button
+        self._armed_key: Optional[int] = None    # cluster awaiting a key-press (None = idle)
+        self._assign_octave = 0                  # octave offset applied to the next key-press
         # Populated on Apply; None means cancelled.
         self.new_notes: Optional[dict[int, list[Segment]]] = None
         self.new_unassigned: list[Segment] = []
@@ -171,10 +192,11 @@ class RecategorizeDialog(QDialog):
 
         sub = QLabel(
             "SAMPLES: drag them between cluster headers to recategorize (Shift/Ctrl-"
-            "click for several), or use 'Assign selected'. CLUSTERS: use 'Move "
-            "cluster' to send a whole cluster to another key — onto an occupied key "
-            "it SWAPS the two. UNASSIGNED = no key/not exported; ✕ REMOVE = dropped. "
-            "Click a sample to hear it. Nothing changes until APPLY."
+            "click for several). CLUSTERS: click a header's 'Assign to Key', then "
+            "PRESS the key you want it on (A W S E D F … piano layout; Z / X = octave "
+            "down / up, Esc cancels) — onto an occupied key it SWAPS the two. "
+            "UNASSIGNED = no key/not exported; ✕ REMOVE = dropped. Click a sample to "
+            "hear it. Nothing changes until APPLY."
         )
         sub.setWordWrap(True)
         sub.setObjectName("dialogSubtle")
@@ -207,56 +229,15 @@ class RecategorizeDialog(QDialog):
 
         self.list = RecatList(self)
         for key in header_keys:
-            self.list.addItem(self._make_header(key, self._key_label(key)))
+            self._add_header(key)
             for sid in seg_of_key.get(key, []):
                 self.list.addItem(self._make_sample(sid))
-        self.list.addItem(self._make_header(_UNASSIGNED_KEY, "Unassigned"))
+        self._add_header(_UNASSIGNED_KEY, "Unassigned")
         for sid in unassigned_ids:
             self.list.addItem(self._make_sample(sid))
-        self.list.addItem(self._make_header(_REMOVE_KEY, "✕ Remove"))
+        self._add_header(_REMOVE_KEY, "✕ Remove")
         root.addWidget(self.list, 1)
         self._after_move()   # stamp initial header counts
-
-        # Manual override: select sample(s) — even across clusters — and drop them
-        # onto a specific key (any GM key, across all octaves), for when the
-        # auto-sorter is wrong. Complements the drag-and-drop.
-        assign_row = QHBoxLayout()
-        assign_lbl = QLabel("Assign selected to key:")
-        assign_lbl.setObjectName("dialogSubtle")
-        self.key_combo = QComboBox()
-        for k in range(MAX_KEYS):
-            self.key_combo.addItem(self._key_option_label(k), k)
-        assign_btn = QPushButton("ASSIGN →")
-        assign_btn.clicked.connect(
-            lambda: self._assign_selected_to_key(self.key_combo.currentData()))
-        assign_row.addWidget(assign_lbl)
-        assign_row.addWidget(self.key_combo, 1)
-        assign_row.addWidget(assign_btn)
-        root.addLayout(assign_row)
-
-        # Whole-cluster move (swap on occupied): pick a source cluster's key and a
-        # target key. This is the cluster-level counterpart to the sample drag.
-        move_row = QHBoxLayout()
-        move_lbl = QLabel("Move cluster on")
-        move_lbl.setObjectName("dialogSubtle")
-        self.src_combo = QComboBox()
-        for k in loaded:
-            self.src_combo.addItem(self._key_option_label(k), k)
-        to_lbl = QLabel("→")
-        to_lbl.setObjectName("dialogSubtle")
-        self.dst_combo = QComboBox()
-        for k in range(MAX_KEYS):
-            self.dst_combo.addItem(self._key_option_label(k), k)
-        move_btn = QPushButton("MOVE ⇄")
-        move_btn.clicked.connect(
-            lambda: self._move_cluster(self.src_combo.currentData(),
-                                       self.dst_combo.currentData()))
-        move_row.addWidget(move_lbl)
-        move_row.addWidget(self.src_combo, 1)
-        move_row.addWidget(to_lbl)
-        move_row.addWidget(self.dst_combo, 1)
-        move_row.addWidget(move_btn)
-        root.addLayout(move_row)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -267,6 +248,24 @@ class RecategorizeDialog(QDialog):
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(apply_btn)
         root.addLayout(btn_row)
+
+    def _add_header(self, key: int, disp: Optional[str] = None,
+                    at: Optional[int] = None) -> QListWidgetItem:
+        """Create a header row for `key`, add it (append, or insert at `at`), and
+        for a real cluster key attach its 'Assign to Key' button widget."""
+        if disp is None:
+            disp = (self._key_label(key) if key >= 0
+                    else "Unassigned" if key == _UNASSIGNED_KEY else "✕ Remove")
+        it = self._make_header(key, disp)
+        if at is None:
+            self.list.addItem(it)
+        else:
+            self.list.insertItem(at, it)
+        if key >= 0:                       # only cluster headers get the arm button
+            w = self._make_header_widget(key, disp)
+            it.setSizeHint(w.sizeHint())
+            self.list.setItemWidget(it, w)
+        return it
 
     def _make_header(self, key: int, disp: str) -> QListWidgetItem:
         it = QListWidgetItem()
@@ -284,6 +283,32 @@ class RecategorizeDialog(QDialog):
         it.setForeground(color)
         it.setBackground(_HEADER_BG)
         return it
+
+    def _make_header_widget(self, key: int, disp: str) -> QWidget:
+        """Row widget for a cluster header: its label plus the arm button that
+        starts key-capture for moving the whole cluster."""
+        w = QWidget()
+        w.setStyleSheet("background:#1a130b;")
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(8, 3, 8, 3)
+        lay.setSpacing(8)
+        lbl = QLabel(self._header_text(disp, 0))
+        lbl.setStyleSheet("color:#ffb15a; font-weight:bold; background:transparent;")
+        btn = QPushButton("Assign to Key")
+        btn.setCheckable(True)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton { color:#ffb15a; background:#241a0e; border:1px solid #5a3f1e;"
+            " border-radius:4px; padding:2px 10px; font-weight:bold; }"
+            "QPushButton:hover { border-color:#ffb15a; }"
+            "QPushButton:checked { color:#120c05; background:#ffb15a; border-color:#ffd089; }"
+        )
+        btn.clicked.connect(lambda checked, k=key: self._on_arm_clicked(k, checked))
+        lay.addWidget(lbl, 1)
+        lay.addWidget(btn, 0)
+        self._hdr_lbl[key] = lbl
+        self._hdr_btn[key] = btn
+        return w
 
     def _make_sample(self, sid: int) -> QListWidgetItem:
         seg = self._by_id[sid]
@@ -308,6 +333,16 @@ class RecategorizeDialog(QDialog):
     def _header_text(disp: str, n: int) -> str:
         return f"{disp.upper()}   ·  {n} sample{'s' if n != 1 else ''}"
 
+    def _set_header_text(self, item: QListWidgetItem, n: int) -> None:
+        """Stamp a header's sample count — onto its label widget for cluster
+        headers (which render via a widget), or the item text for the sentinels."""
+        txt = self._header_text(item.data(_DISP_ROLE), n)
+        lbl = self._hdr_lbl.get(item.data(_DATA_ROLE))
+        if lbl is not None:
+            lbl.setText(txt)
+        else:
+            item.setText(txt)
+
     def _after_move(self) -> None:
         """Re-derive each header's sample count from the current row order."""
         cur: Optional[QListWidgetItem] = None
@@ -316,12 +351,12 @@ class RecategorizeDialog(QDialog):
             it = self.list.item(r)
             if it.data(_KIND_ROLE) == "header":
                 if cur is not None:
-                    cur.setText(self._header_text(cur.data(_DISP_ROLE), n))
+                    self._set_header_text(cur, n)
                 cur, n = it, 0
             else:
                 n += 1
         if cur is not None:
-            cur.setText(self._header_text(cur.data(_DISP_ROLE), n))
+            self._set_header_text(cur, n)
 
     # ---------- interaction ----------
 
@@ -333,14 +368,6 @@ class RecategorizeDialog(QDialog):
         seg = self._by_id.get(item.data(_DATA_ROLE))
         if seg is not None:
             self._engine.play(seg.audio, gain=self._get_gain(), note_id=-1)
-
-    def _key_option_label(self, key: int) -> str:
-        """Human label for the assign-to-key picker: note+octave and GM cap."""
-        note = NOTE_NAMES_12[key % 12]
-        octave = key // 12
-        suffix = f"+{octave}" if octave else ""
-        cap = KEY_CAP_LABEL.get(key, "")
-        return f"{note}{suffix}   {cap}".rstrip()
 
     def _header_row_for(self, key: int) -> Optional[int]:
         for r in range(self.list.count()):
@@ -375,25 +402,86 @@ class RecategorizeDialog(QDialog):
             insert = self._header_row_for(_UNASSIGNED_KEY)
             if insert is None:
                 insert = self.list.count()
-            self.list.insertItem(insert, self._make_header(key, self._key_label(key)))
+            self._add_header(key, at=insert)
             hdr = insert
         at = hdr + 1
         for sid in sids:
             self.list.insertItem(at, self._make_sample(sid))
             at += 1
 
-    def _assign_selected_to_key(self, key: int) -> None:
-        """Move the currently-selected SAMPLE(s) onto `key`, creating that key's
-        header if needed. The explicit alternative to dragging samples."""
-        if key is None:
+    # ---------- cluster → key capture ----------
+
+    def _on_arm_clicked(self, key: int, checked: bool) -> None:
+        """A header's 'Assign to Key' button was toggled: arm (start capture) or
+        disarm this cluster."""
+        if checked:
+            self._arm(key)
+        else:
+            self._disarm()
+
+    def _arm(self, key: int) -> None:
+        """Enter key-capture for the cluster on `key`: grab the keyboard so the
+        next A/W/S/E/D… press (Z/X for octave) targets a destination key."""
+        if self._armed_key is not None and self._armed_key != key:
+            prev = self._hdr_btn.get(self._armed_key)
+            if prev is not None:
+                prev.setChecked(False)
+        self._armed_key = key
+        self._assign_octave = 0
+        self.grabKeyboard()          # route every keystroke to this dialog
+        self._refresh_arm_labels()
+
+    def _disarm(self) -> None:
+        if self._armed_key is None:
             return
-        sids = [it.data(_DATA_ROLE) for it in self.list.selectedItems()
-                if it.data(_KIND_ROLE) == "sample"]
-        if not sids:
+        btn = self._hdr_btn.get(self._armed_key)
+        if btn is not None:
+            btn.setChecked(False)
+        self._armed_key = None
+        self.releaseKeyboard()
+        self._refresh_arm_labels()
+
+    def _refresh_arm_labels(self) -> None:
+        """Light the armed cluster's button (showing the live octave) and reset
+        every other button to its resting label."""
+        for key, btn in self._hdr_btn.items():
+            if key == self._armed_key:
+                oct_txt = f"+{self._assign_octave}" if self._assign_octave else "0"
+                btn.setText(f"⌨ press key · oct {oct_txt}")
+                if not btn.isChecked():
+                    btn.setChecked(True)
+            else:
+                btn.setText("Assign to Key")
+                if btn.isChecked():
+                    btn.setChecked(False)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        """While a cluster is armed, capture the keystroke as its destination key
+        instead of the dialog's normal handling. Z/X change octave; a note key
+        commits the move (swapping on an occupied key); Esc cancels."""
+        if self._armed_key is None:
+            super().keyPressEvent(event)
             return
-        self._remove_samples(sids)
-        self._insert_under(key, sids)
-        self._after_move()
+        k = event.key()
+        if k == Qt.Key_Escape:
+            self._disarm()
+            return
+        if k == Qt.Key_Z:
+            self._assign_octave = max(0, self._assign_octave - 1)
+            self._refresh_arm_labels()
+            return
+        if k == Qt.Key_X:
+            self._assign_octave = min(_MAX_OCTAVE, self._assign_octave + 1)
+            self._refresh_arm_labels()
+            return
+        note = _KEY_TO_NOTE.get(k)
+        if note is None:
+            return                   # swallow other keys while armed
+        target = note + self._assign_octave * _OCTAVE_STEP
+        src = self._armed_key
+        self._disarm()
+        if 0 <= target < MAX_KEYS and target != src:
+            self._move_cluster(src, target)
 
     def _move_cluster(self, src: int, dst: int) -> None:
         """Move the WHOLE cluster on `src` to `dst`. If `dst` already holds a
@@ -409,6 +497,13 @@ class RecategorizeDialog(QDialog):
         if dst_sids:
             self._insert_under(src, dst_sids)
         self._after_move()
+
+    def done(self, result: int) -> None:
+        # Never leave the app-wide keyboard grab dangling if the dialog closes
+        # (Apply/Cancel) mid-capture.
+        if self._armed_key is not None:
+            self.releaseKeyboard()
+        super().done(result)
 
     def _on_apply(self) -> None:
         new_notes: dict[int, list[Segment]] = {}
