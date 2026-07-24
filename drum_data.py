@@ -31,6 +31,7 @@ import numpy as np
 
 from pipeline import (
     load_audio, features_from_oneshot, compute_features, TARGET_SR,
+    detect_onsets, extract_segments, CLASSIFY_FEATURE_LEN_S,
 )
 from sort_samples import classify as name_classify
 from model_analysis import LABEL_MAP, AUDIO_EXTS, RAW
@@ -50,6 +51,45 @@ TAXONOMY: dict[str, list[str]] = {
 LEAF_TO_FAMILY: dict[str, str] = {
     leaf: fam for fam, leaves in TAXONOMY.items() for leaf in leaves
 }
+
+
+# The user's hand-labeled kit (datasets/test data/) — the held-out target the
+# autosorter is optimized to reproduce. Filenames encode ground truth; finer
+# articulations collapse to the trained taxonomy leaves.
+TEST_DATA_DIR = Path(__file__).resolve().parent / "datasets" / "test data"
+TEST_FILE_LEAF: dict[str, str] = {
+    "Kick": "kick", "Snares": "snare",
+    "Hats 1 (Loose)": "hats", "Hats 2 (Tight)": "hats", "Hats 3 (Open)": "hats",
+    "High Tom": "hitom", "Med Tom": "midtom", "Low Tom": "lotom",
+    "Crash": "crash",
+    "Ride": "ride", "Ride 2": "ride", "Ride (Bell)": "ride", "Ride Smack": "ride",
+    "Rimknocks": "snare",     # side-stick — collapses to snare (no side_stick leaf yet)
+    "Stick Click": "snare",
+}
+
+
+def load_test_kit(sensitivity: float = 0.35, trim_db: float = -42.2,
+                  seg_len_s: float = 0.7) -> list["Record"]:
+    """Onset-slice each labeled `datasets/test data/*.wav` into Records (leaf from
+    the filename, group='user_kit'). Uses the app's real onset/extract path with
+    the tuned defaults, so the slices match what the live pipeline produces."""
+    out: list[Record] = []
+    for stem, leaf in TEST_FILE_LEAF.items():
+        path = TEST_DATA_DIR / f"{stem}.wav"
+        if not path.exists():
+            continue
+        audio = load_audio(str(path))
+        onsets = detect_onsets(audio, sensitivity=sensitivity)
+        segs = extract_segments(
+            audio, onsets, segment_length_s=seg_len_s, trim_threshold_db=trim_db,
+            noise_gate_db=None, clip_at_next_onset=False,
+            feature_length_s=CLASSIFY_FEATURE_LEN_S)
+        for s in segs:
+            sl = s.classify_audio if s.classify_audio is not None else s.audio
+            rec = _record(sl, s.features, leaf, "acoustic", "user_kit")
+            if rec is not None:
+                out.append(rec)
+    return out
 
 
 @dataclass
