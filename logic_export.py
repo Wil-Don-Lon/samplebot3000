@@ -69,15 +69,18 @@ def instrument_to_zonespecs(
     Two layouts for keys with several stacked samples:
 
     - velocity split (default): soft hits on low velocities, loud on high —
-      matches the app's VEL LAYER playback. One group; deterministic by velocity.
-    - round robin (`round_robin=True`): every sample covers the full velocity
-      range and lands in its OWN group; Logic cycles the groups so a different
-      sample fires each hit — the Logic-side stand-in for the app's RANDOM mode.
+      matches the app's VEL LAYER playback. Deterministic by velocity.
+    - round robin (`round_robin=True`): every sample covers the FULL velocity
+      range, so a key's samples OVERLAP. Logic's Sampler auto-cycles overlapping
+      same-key zones — that overlap IS the round-robin, and it's exactly how
+      Logic's own factory kits encode it (verified against several). The
+      Logic-side stand-in for the app's RANDOM mode.
 
-    EXS24 cycles round-robin groups GLOBALLY, so a key with fewer samples than
-    the deepest key would hit silent groups. We avoid that by padding each key's
-    cycle: it reuses its own samples (same WAV, no duplication on disk) to fill
-    up to the max depth, so every group has a zone for every key.
+    Both layouts put every zone in the single shared group. Round-robin needs no
+    per-sample groups and no group "previous-group" chain — factory kits leave
+    those unset even for keys with several round-robin samples, and setting them
+    makes Logic steal one voice across the chain (gating + only one sample ever
+    sounding, while the display still cycles).
     """
     valid: dict[int, list] = {}
     for key in sorted(notes):
@@ -90,8 +93,7 @@ def instrument_to_zonespecs(
         return []
 
     # Per-segment audio, optionally scaled by `gain_for` (e.g. equal-loudness).
-    # Cached by id(seg.audio) so round-robin padding still dedups to one WAV
-    # (same gained array object reused across a key's padded zones).
+    # Cached by id(seg.audio) so a reused Segment.audio still dedups to one WAV.
     _gained: dict[int, np.ndarray] = {}
     def aud(seg) -> np.ndarray:
         raw = np.asarray(seg.audio, dtype=np.float32).ravel()
@@ -125,13 +127,12 @@ def instrument_to_zonespecs(
                 ))
         return zones
 
-    # Round-robin, matching how Logic's own kits encode it: each sample on a key
-    # is its OWN group, full-velocity, and a key's groups are chained into a
-    # round-robin cycle by write_exs_kit (via the EXS24 group "previous group"
-    # link at offset 80). One group + one zone + one WAV per sample; no padding.
+    # Round-robin, matching how Logic's own kits actually encode it: every sample
+    # on a key becomes its own FULL-velocity zone, so a key's samples overlap and
+    # Logic auto-cycles them. All zones share group 0 (no per-sample groups, no
+    # chain) — see the docstring for why chaining causes the gating bug.
     zones = []
     used = set()
-    gi = 0
     for key, segs in valid.items():
         label = sanitize_name(key_label(key), f"Key{key}")
         n = len(segs)
@@ -141,9 +142,8 @@ def instrument_to_zonespecs(
             zones.append(ZoneSpec(
                 audio=aud(seg), name=_unique(base, used), midi_note=midi_note,
                 vel_low=1, vel_high=127, one_shot=one_shot,
-                group_index=gi,
+                group_index=0,
             ))
-            gi += 1
     return zones
 
 
@@ -234,15 +234,15 @@ def _zone_content(z: ZoneSpec, sample_index: int, group_index: int,
     return bytes(b)
 
 
-def _group_content(rr_prev: int = -1, round_robin: bool = False) -> bytes:
-    """Group block from the factory template. Its polyphony byte (offset 2 = 0 =
-    max voices) and options byte (offset 3 = 1 = polyphonic) already prevent
-    per-group choking. For round-robin we set the previous-group link (offset 80)
-    and the cycle flag (offset 90 = 1); a chain head / non-RR group keeps -1 / 0."""
-    b = bytearray(_T.GROUP_TMPL)
-    _put(b, 80, _le32(rr_prev if rr_prev >= 0 else 0xFFFFFFFF))
-    b[90] = 1 if round_robin else 0
-    return bytes(b)
+def _group_content() -> bytes:
+    """The single shared group, verbatim from the factory template: polyphonic
+    (offset 3 bit0 = 1), max voices (offset 2 = 0), no round-robin chain (offset
+    80 = -1) and no cycle flag (offset 90 = 0). Logic's own kits set exactly this
+    even for keys with several round-robin samples — round-robin comes from the
+    overlapping zones, never from group fields. Chaining groups here (an earlier
+    attempt) made Logic steal one voice across the chain: gating, plus only one
+    sample ever sounding while the zone display still cycled."""
+    return bytes(_T.GROUP_TMPL)
 
 
 def _sample_content(length: int, sample_rate: int, bit_depth: int,
@@ -345,24 +345,10 @@ def write_exs_kit(
     if progress:
         progress("building instrument", 0.8)
 
-    # 3) Groups: one per distinct group_index. Round-robin (RANDOM export) puts
-    #    each sample in its own group and chains a KEY's groups together via the
-    #    "previous group" link, exactly like Logic's factory kits: within each
-    #    key (same midi_note), the first group is the chain head (-1) and every
-    #    later group points to the prior one. Velocity-split has one group → -1.
+    # 3) One shared group holds every zone (both layouts). Round-robin rides on
+    #    the overlapping same-key zones, not on group fields, so there is no chain
+    #    to build — the group is the factory template verbatim.
     n_groups = max((z.group_index for z in zones), default=0) + 1
-    rr_prev = [-1] * n_groups
-    is_rr = [False] * n_groups            # groups in a >1-sample chain -> cycle mode
-    chains: dict[int, list[int]] = {}
-    for z in zones:
-        chains.setdefault(z.midi_note, []).append(z.group_index)
-    for gidxs in chains.values():
-        ordered = sorted(set(gidxs))
-        if len(ordered) > 1:
-            for g in ordered:
-                is_rr[g] = True           # whole chain rotates (incl. the head)
-        for j in range(1, len(ordered)):
-            rr_prev[ordered[j]] = ordered[j - 1]
 
     # 4) Assemble the EXS blocks in file order: instrument, zones, groups,
     #    samples, params, then the six cosmetic output blocks.
@@ -375,8 +361,7 @@ def write_exs_kit(
                       _zone_content(z, sample_index=sample_of_zone[i],
                                     group_index=z.group_index, length=length))
     for gi in range(n_groups):
-        out += _block(_TYPE_GROUP, gi, safe_kit,
-                      _group_content(rr_prev=rr_prev[gi], round_robin=is_rr[gi]))
+        out += _block(_TYPE_GROUP, gi, safe_kit, _group_content())
     for si, z in enumerate(unique_zones):
         length, file_size, data_start, file_name = sample_meta[si]
         out += _block(_TYPE_SAMPLE, si, z.name,

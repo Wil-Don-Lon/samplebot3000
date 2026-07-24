@@ -155,9 +155,11 @@ def test_exs_roundtrip():
 
 
 def test_exs_round_robin():
-    # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. Round-robin = one group per
-    # sample; a KEY's groups are chained via the EXS24 "previous group" link
-    # (offset 80): chain head = -1, each later group -> the prior group's index.
+    # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. Modern round-robin = several
+    # FULL-velocity zones OVERLAPPING on one key, all in the single shared group;
+    # Logic auto-cycles overlapping zones. NO per-sample groups, NO group chain,
+    # NO cycle flag — factory kits leave those unset, and setting them makes Logic
+    # steal one voice across the chain (the gating / only-one-sample-plays bug).
     notes = {
         0: [_make_seg(0.2), _make_seg(0.05), _make_seg(0.4)],
         5: [_make_seg(0.3), _make_seg(0.1)],
@@ -167,9 +169,9 @@ def test_exs_round_robin():
     zones = lx.instrument_to_zonespecs(
         notes, key_label=lambda k: labels[k], round_robin=True)
 
-    # One zone (and one group) per sample; every zone full-velocity.
+    # One zone per sample; every zone full-velocity and in the shared group 0.
     assert len(zones) == 6
-    assert [z.group_index for z in zones] == [0, 1, 2, 3, 4, 5]
+    assert all(z.group_index == 0 for z in zones)
     assert all(z.vel_low == 1 and z.vel_high == 127 for z in zones)
 
     with tempfile.TemporaryDirectory() as d:
@@ -183,37 +185,31 @@ def test_exs_round_robin():
         samples = by_type[lx._TYPE_SAMPLE]
         zone_blocks = by_type[lx._TYPE_ZONE]
 
-        assert len(groups) == 6 and len(samples) == 6 and len(zone_blocks) == 6
+        # Exactly ONE group for the whole kit; one sample + one zone per sample.
+        assert len(groups) == 1 and len(samples) == 6 and len(zone_blocks) == 6
         ic = by_type[lx._TYPE_INSTRUMENT][0][3]
         n_zones, n_groups, n_samples, _ = struct.unpack("<IIII", ic[4:20])
-        assert (n_zones, n_groups, n_samples) == (6, 6, 6)
+        assert (n_zones, n_groups, n_samples) == (6, 1, 6)
 
-        # Read each group's round-robin previous-link (u32 @80) and cycle flag (@90).
-        rr_prev = {}
-        cycle = {}
-        for _t, gi, _n, c in groups:
-            v = struct.unpack("<I", c[80:84])[0]
-            rr_prev[gi] = -1 if v == 0xFFFFFFFF else v
-            cycle[gi] = c[90]
+        # The shared group must be a clean factory group: no chain (@80 = -1),
+        # no cycle flag (@90 = 0), polyphonic (@3 bit0), max voices (@2 = 0).
+        gc = groups[0][3]
+        assert struct.unpack("<i", gc[80:84])[0] == -1, "group must not chain"
+        assert gc[90] == 0, "group must not set the cycle flag"
+        assert gc[2] == 0 and (gc[3] & 1), "group must be polyphonic / max voices"
 
-        # Group each zone's group by MIDI note; each key must be a valid chain.
+        # Each key's samples overlap: several full-velocity zones on one note, all
+        # in group 0, each pointing at a distinct sample.
         by_note = {}
         for _t, _i, _n, c in zone_blocks:
-            note = c[1]
-            gidx = struct.unpack("<I", c[88:92])[0]
-            by_note.setdefault(note, []).append(gidx)
+            assert struct.unpack("<I", c[88:92])[0] == 0, "all zones share group 0"
+            assert c[9] <= 1 and c[10] == 127, "round-robin zones are full-velocity"
+            by_note.setdefault(c[1], []).append(struct.unpack("<I", c[92:96])[0])
         # key 0->MIDI 36 (3 samples), 5->41 (2), 7->43 (1)
         assert sorted(by_note) == [36, 41, 43]
-        for note, gs in by_note.items():
-            gs = sorted(gs)
-            assert rr_prev[gs[0]] == -1, f"note {note} head not -1"
-            for j in range(1, len(gs)):
-                assert rr_prev[gs[j]] == gs[j - 1], f"note {note} broken chain"
-            # Multi-sample keys must CYCLE (flag 1); the lone single-sample key
-            # (MIDI 43) must not — a cycle flag on a 1-group chain gates itself.
-            want = 1 if len(gs) > 1 else 0
-            for g in gs:
-                assert cycle[g] == want, f"note {note} wrong cycle flag"
+        assert sorted(len(v) for v in by_note.values()) == [1, 2, 3]
+        for note, sids in by_note.items():
+            assert len(set(sids)) == len(sids), f"note {note} zones reuse a sample"
 
         kit_dir = exs_path.parent
         for _t, _i, _n, c in samples:
