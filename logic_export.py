@@ -62,32 +62,29 @@ def instrument_to_zonespecs(
     base_note: int = BASE_MIDI_NOTE,
     one_shot: bool = True,
     round_robin: bool = False,
-    gain_for: Optional[Callable[[object], float]] = None,
+    process_audio: Optional[Callable[[object, np.ndarray], np.ndarray]] = None,
 ) -> list[ZoneSpec]:
     """Flatten `Instrument.notes` (key index -> [Segment]) into ZoneSpecs.
 
     Two layouts for keys with several stacked samples:
 
-    - velocity split (default): soft hits on low velocities, loud on high —
-      matches the app's VEL LAYER playback. Deterministic by velocity.
-    - round robin (`round_robin=True`): every sample covers the FULL velocity
-      range, so a key's samples OVERLAP. Logic's Sampler auto-cycles overlapping
-      same-key zones — that overlap IS the round-robin, and it's exactly how
-      Logic's own factory kits encode it (verified against several). The
-      Logic-side stand-in for the app's RANDOM mode.
+    - velocity split (default): a key's samples partition the velocity range —
+      soft hits low, loud hits high — so the hit velocity picks one. This is how
+      Logic's own factory drum kits give per-hit variation, and it exports
+      reliably. Matches the app's VEL LAYER mode.
+    - round robin (`round_robin=True`): every sample is a FULL-velocity zone and
+      the i-th sample of every key goes in group i, so a key's samples overlap
+      across groups. This mirrors how Logic's *consolidated* factory kits arrange
+      round-robin alternates. NOTE: Logic's separate-WAV ("modern"/electronic)
+      instrument format — the one this writer emits — is NOT known to actually
+      rotate these at play time (its factory kits use one sample per key), so
+      round-robin export may not audibly cycle in Logic. Prefer velocity split
+      for reliable variation. Kept because it still carries every sample.
 
     Both layouts split the kit across several clean groups (factory kits always
     use several — one kit-wide group left most keys silent in Logic; a group
-    chain stole voices → gating). Grouping differs by mode:
-
-    - velocity split: one group per KEY. A key's velocity layers don't overlap,
-      so they coexist in one group and the incoming velocity picks one.
-    - round robin: one group per RR POSITION — the i-th sample of every key goes
-      in group i. A key's full-velocity samples thus overlap ACROSS groups, and
-      Logic round-robins overlapping zones ONLY when they sit in different groups
-      (same-group overlap just layers — verified against Deep Crunch / Blowing
-      Speakers). Groups stay clean (no chain), so the rotation is polyphonic and
-      never steals a voice.
+    chain stole voices → gating). Velocity split uses one group per KEY; round
+    robin uses one group per RR position.
     """
     valid: dict[int, list] = {}
     for key in sorted(notes):
@@ -100,18 +97,20 @@ def instrument_to_zonespecs(
     if not valid:
         return []
 
-    # Per-segment audio, optionally scaled by `gain_for` (e.g. equal-loudness).
-    # Cached by id(seg.audio) so a reused Segment.audio still dedups to one WAV.
-    _gained: dict[int, np.ndarray] = {}
+    # Per-segment audio, optionally run through `process_audio(seg, raw)` to bake
+    # the app's per-sample effects (volume, filter, envelope, equal-loudness) into
+    # the exported WAV. Cached by id(seg.audio) so a reused Segment.audio still
+    # dedups to one WAV.
+    _processed: dict[int, np.ndarray] = {}
     def aud(seg) -> np.ndarray:
         raw = np.asarray(seg.audio, dtype=np.float32).ravel()
-        if gain_for is None:
+        if process_audio is None:
             return raw
         key = id(seg.audio)
-        if key not in _gained:
-            g = float(gain_for(seg))
-            _gained[key] = (raw * g).astype(np.float32) if g != 1.0 else raw
-        return _gained[key]
+        if key not in _processed:
+            out = np.asarray(process_audio(seg, raw), dtype=np.float32).ravel()
+            _processed[key] = out
+        return _processed[key]
 
     # Each key is its own group (group_index = the key's position in `valid`), so
     # keys never share a group. Logic's factory kits always use several groups;

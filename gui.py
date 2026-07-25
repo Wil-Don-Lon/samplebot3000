@@ -80,6 +80,43 @@ def velocity_lowpass(audio: np.ndarray, velocity: int, sr: int = 44100) -> np.nd
     return lfilter(b, a, audio).astype(np.float32, copy=False)
 
 
+def bake_lowpass(audio: np.ndarray, cutoff_hz: float, sr: int) -> np.ndarray:
+    """Bake the per-sample lowpass into `audio` — a 4th-order Butterworth
+    (~24 dB/oct), matching the engine's per-voice cascade closely enough. No-op
+    at/above ~0.45·SR (the slider's 'open' end) or without scipy."""
+    nyq = sr * 0.5
+    if not _HAVE_SCIPY or audio.size < 16 or cutoff_hz >= sr * 0.45:
+        return audio
+    b, a = butter(4, max(20.0, cutoff_hz) / nyq, btype="low")
+    return lfilter(b, a, audio).astype(np.float32, copy=False)
+
+
+def bake_adsr(audio: np.ndarray, a_s: float, d_s: float, s_level: float,
+              sr: int) -> np.ndarray:
+    """Bake the Attack→Decay→Sustain amplitude envelope into `audio`. Release is
+    a live note-off articulation, so it isn't baked (a one-shot drum plays at the
+    sustain level to its end). No-op for the default 0/0/1.0 envelope."""
+    n = audio.shape[0]
+    a = max(0, int(a_s * sr))
+    d = max(0, int(d_s * sr))
+    if (a == 0 and d == 0) or n == 0:
+        return audio if s_level >= 1.0 else (audio * np.float32(s_level))
+    env = np.empty(n, dtype=np.float32)
+    i = 0
+    if a > 0:                                   # attack: 0 → 1
+        k = min(a, n)
+        env[:k] = np.linspace(0.0, 1.0, k, endpoint=False, dtype=np.float32)
+        i = k
+    if i < n and d > 0:                         # decay: 1 → sustain
+        k = min(d, n - i)
+        env[i:i + k] = 1.0 + (s_level - 1.0) * np.linspace(
+            0.0, 1.0, k, endpoint=False, dtype=np.float32)
+        i += k
+    if i < n:                                   # sustain hold
+        env[i:] = s_level
+    return (audio * env).astype(np.float32, copy=False)
+
+
 KEY_TO_NOTE = {
     Qt.Key_A: 0,  Qt.Key_W: 1,  Qt.Key_S: 2,  Qt.Key_E: 3,  Qt.Key_D: 4,
     Qt.Key_F: 5,  Qt.Key_T: 6,  Qt.Key_G: 7,  Qt.Key_Y: 8,  Qt.Key_H: 9,
@@ -1416,14 +1453,15 @@ class MainWindow(QMainWindow):
         # round-robin groups (a different sample each hit); VEL LAYER → velocity
         # split. Single-sample keys are identical either way.
         round_robin = self._sample_mode == "random"
-        # Bake the equal-loudness gain into the exported WAVs when it's on, so the
-        # Logic kit sounds balanced like the app does.
-        gain_for = ((lambda s: getattr(s, "loudness_gain", 1.0))
-                    if self._equal_loudness else None)
+        # Bake each sample's playback effects (VOLUME trim, per-sample FILTER,
+        # ENVELOPE) — plus equal-loudness when on — into the exported WAVs so the
+        # Logic kit sounds like the app. Velocity and its live darkening lowpass
+        # stay live (the exported kit responds to how hard you play).
+        process_audio = self._make_export_processor()
         try:
             zones = logic_export.instrument_to_zonespecs(
                 self._instrument.notes, key_label=self._current_key_label,
-                round_robin=round_robin, gain_for=gain_for)
+                round_robin=round_robin, process_audio=process_audio)
             exs_path = logic_export.write_exs_kit(
                 name, zones, self._instrument.sample_rate, dest,
                 progress=lambda msg, frac: self._on_progress(f"export: {msg}", frac),
@@ -1436,6 +1474,29 @@ class MainWindow(QMainWindow):
         layout = "round-robin" if round_robin else "velocity-split"
         loud = "  ·  equal-loudness" if self._equal_loudness else ""
         self.status.setText(f"exported '{name}'  ·  {layout}{loud}  ·  {where}")
+
+    def _make_export_processor(self):
+        """Return process_audio(seg, raw) that bakes a sample's stored playback
+        settings into its audio the same way _play_selected_sample renders them:
+        VOLUME trim × equal-loudness gain, the A→D→S envelope, then the per-sample
+        lowpass. Velocity (and its darkening lowpass) is a live hit control, so it
+        is NOT baked. Samples left at defaults come out unchanged."""
+        sr = int(self._instrument.sample_rate)
+        equal_loudness = self._equal_loudness
+
+        def process(seg, raw):
+            st = self._settings_for(seg)
+            audio = np.asarray(raw, dtype=np.float32).ravel().copy()
+            gain = getattr(st, "volume", 100) / 100.0
+            if equal_loudness:
+                gain *= float(getattr(seg, "loudness_gain", 1.0))
+            if gain != 1.0:
+                audio *= np.float32(gain)
+            audio = bake_adsr(audio, st.a * 0.01, st.d * 0.01, st.s / 100.0, sr)
+            audio = bake_lowpass(audio, self._lpf_from_slider(st.lpf), sr)
+            return audio
+
+        return process
 
     @Slot()
     def _on_adsr_changed(self) -> None:
