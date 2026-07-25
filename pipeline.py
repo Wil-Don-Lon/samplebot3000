@@ -60,6 +60,10 @@ MIN_SEGMENT_S = 0.05
 MIN_ONSET_GAP_S = 0.10            # reject onsets less than 100ms apart
 TRIM_THRESHOLD_DB_DEFAULT = -38.0 # default silence threshold for trim (dBFS)
 TRIM_SMOOTH_SAMPLES = 64          # ~1.5ms moving-average window for trim
+# Per-sample editor: how much extra raw source to keep around each detected
+# slice so the editor can pull the start earlier or ring the tail out longer.
+EDIT_PRE_PAD_S = 0.10             # runway before the onset (catch a soft attack)
+EDIT_POST_PAD_S = 2.5            # runway after the slice end (elongate the tail)
 
 # Similarity-based dedupe: two segments within DEDUP_TIME_WINDOW (set dynamically
 # to the longest trimmed duration) and closer than DEDUP_DISTANCE in 57-dim
@@ -116,6 +120,14 @@ class Segment:
     # mode only). Embedding-based classifiers re-embed THIS, not `audio` (the
     # variable-length playback slice), to stay train/serve-consistent.
     classify_audio: Optional[np.ndarray] = None
+    # Padded raw (un-normalized) source window around the hit, kept so the
+    # per-sample editor can retrim/elongate `audio` after detection. `src_start`
+    # / `src_end` are the current slice bounds INTO `source`; `audio` is always
+    # normalize(source[src_start:src_end]). None → no source retained (older kit);
+    # the editor then treats `audio` itself as the source (inward trim only).
+    source: Optional[np.ndarray] = None
+    src_start: int = 0
+    src_end: int = 0
 
 
 @dataclass
@@ -391,6 +403,35 @@ def normalize_sample(audio: np.ndarray, peak_target: float = 0.95) -> np.ndarray
     return (audio * (peak_target / peak)).astype(np.float32, copy=False)
 
 
+def ensure_source(seg: "Segment") -> None:
+    """Guarantee `seg.source`/`src_start`/`src_end` exist. Older segments (loaded
+    kits without a saved source buffer) get their own `audio` as the source, so
+    the editor can still trim inward — just not elongate past the stored slice."""
+    if seg.source is None or np.asarray(seg.source).size == 0:
+        seg.source = np.asarray(seg.audio, dtype=np.float32).ravel()
+        seg.src_start = 0
+        seg.src_end = int(seg.source.shape[0])
+
+
+def reslice_segment(seg: "Segment", start: int, end: int) -> None:
+    """Retrim/elongate a segment to source[start:end] (indices into seg.source),
+    re-materializing `audio` (peak-normalized, like detection) plus the derived
+    rms / dominant_freq. Clamped to the source bounds; a too-short request is
+    ignored. Does NOT touch features/cluster — editing shapes the played/exported
+    audio, never the clustering the user already arranged."""
+    ensure_source(seg)
+    n = int(seg.source.shape[0])
+    start = max(0, min(int(start), n - 1))
+    end = max(start + 1, min(int(end), n))
+    if end - start < MIN_SEGMENT_SAMPLES:
+        end = min(n, start + MIN_SEGMENT_SAMPLES)
+    seg.src_start, seg.src_end = start, end
+    seg.audio = normalize_sample(seg.source[start:end].copy())
+    seg.rms = float(np.sqrt(np.mean(seg.audio.astype(np.float64) ** 2))) \
+        if seg.audio.size else 0.0
+    seg.dominant_freq = dominant_frequency(seg.audio)
+
+
 def segment_features(
     chunk: np.ndarray,
     trim_threshold_db: float = TRIM_THRESHOLD_DB_DEFAULT,
@@ -525,6 +566,19 @@ def extract_segments(
 
         rms = float(np.sqrt(np.mean(sample.astype(np.float64) ** 2)))
         dom_freq = dominant_frequency(sample)
+
+        # Padded raw source window for the per-sample editor: from a little
+        # before the onset to a good stretch past the (tail-trimmed) slice end,
+        # clamped to the file. `audio` is normalize(sample); its length equals the
+        # tail-trimmed slice, so the current slice sits at [src_start, src_end).
+        pre = int(EDIT_PRE_PAD_S * TARGET_SR)
+        post = int(EDIT_POST_PAD_S * TARGET_SR)
+        buf_start = max(0, start - pre)
+        buf_end = min(audio.shape[0], start + sample.shape[0] + post)
+        source = audio[buf_start:buf_end].astype(np.float32, copy=True)
+        src_start = start - buf_start
+        src_end = src_start + int(sample.shape[0])
+
         segments.append(
             Segment(
                 audio=sample,
@@ -533,6 +587,9 @@ def extract_segments(
                 rms=rms,
                 dominant_freq=dom_freq,
                 classify_audio=classify_audio,
+                source=source,
+                src_start=src_start,
+                src_end=src_end,
             )
         )
 

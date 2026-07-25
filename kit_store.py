@@ -78,7 +78,7 @@ def save_kit(
     def _entry(seg, fname: str) -> dict:
         audio = np.asarray(seg.audio, dtype=np.float32).ravel()
         sf.write(str(kit_dir / fname), audio, sr, subtype="FLOAT")
-        return {
+        entry = {
             "file": fname,
             "label": getattr(seg, "label", "") or "",
             "label_conf": float(getattr(seg, "label_conf", 0.0) or 0.0),
@@ -87,6 +87,17 @@ def save_kit(
             "rms": float(getattr(seg, "rms", 0.0) or 0.0),
             "playback": _playback_to_dict(getattr(seg, "playback", None)),
         }
+        # Padded source buffer + current slice bounds, so the per-sample editor
+        # can still elongate a sample after a save/reload (not just trim inward).
+        src = getattr(seg, "source", None)
+        if src is not None and np.asarray(src).size:
+            src_name = fname[:-4] + "_src.wav"
+            sf.write(str(kit_dir / src_name),
+                     np.asarray(src, dtype=np.float32).ravel(), sr, subtype="FLOAT")
+            entry["source_file"] = src_name
+            entry["src_start"] = int(getattr(seg, "src_start", 0) or 0)
+            entry["src_end"] = int(getattr(seg, "src_end", 0) or 0)
+        return entry
 
     def _usable(segs):
         return [s for s in segs if getattr(s, "audio", None) is not None
@@ -132,6 +143,13 @@ def load_kit(
         pb = None
         if playback_factory is not None and entry.get("playback"):
             pb = playback_factory(**entry["playback"])
+        source, s0, s1 = None, 0, 0
+        src_file = entry.get("source_file")
+        if src_file and (kit_dir / src_file).exists():
+            source, _ = sf.read(str(kit_dir / src_file), dtype="float32")
+            source = np.asarray(source, dtype=np.float32).ravel()
+            s0 = int(entry.get("src_start", 0))
+            s1 = int(entry.get("src_end", source.shape[0]))
         return Segment(
             audio=audio,
             onset_time=float(entry.get("onset_time", 0.0)),
@@ -143,6 +161,9 @@ def load_kit(
             label=entry.get("label", ""),
             label_conf=float(entry.get("label_conf", 0.0)),
             playback=pb,
+            source=source,
+            src_start=s0,
+            src_end=s1,
         )
 
     for key_str, entries in manifest.get("keys", {}).items():

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QApplication, QLineEdit, QDialog, QListWidget, QListWidgetItem,
 )
 
+import pipeline as P
 from pipeline import (
     run_pipeline, assign_keys_to_clusters, build_instrument_drumkeys_gm,
     Instrument, NOTE_NAMES, NOTE_NAMES_12, MAX_KEYS, KEY_CAP_LABEL, DRUM_KEYMAP,
@@ -32,7 +33,8 @@ from audio_engine import AudioEngine
 from piano_widget import PianoKeyboardWidget
 from recategorize_dialog import RecategorizeDialog
 from adsr_widget import ADSREnvelopeWidget
-from moog_widgets import Knob, ToggleSwitch, LED, StepGrid
+from moog_widgets import Knob, ToggleSwitch, LED
+from waveform_editor import WaveformEditor
 import kit_store
 import logic_export
 from logic_export import BASE_MIDI_NOTE
@@ -45,7 +47,6 @@ try:
 except Exception:  # noqa: BLE001
     _HAVE_SCIPY = False
 
-N_STEPS = 16  # sequencer length
 
 
 from dataclasses import dataclass
@@ -558,7 +559,6 @@ class MainWindow(QMainWindow):
         # A-weighted equal-loudness normalization (off by default; opt-in).
         self._equal_loudness: bool = False
         self._selected_key: Optional[int] = None
-        self._patterns: dict[int, list[bool]] = {}    # key -> 16-step pattern
         # True while pushing a sample's settings into the controls, so the
         # control-changed handlers don't write them straight back.
         self._loading_settings: bool = False
@@ -838,15 +838,17 @@ class MainWindow(QMainWindow):
         self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         col.addWidget(self.status)
 
-        # 16-step sequencer grid (select a key, then light up its steps).
+        # Per-sample waveform editor. Press a key (or use ◀ ▶) to load the active
+        # sample; drag the two ends to retrim the start or elongate the tail into
+        # the padded runway. Edits change what plays AND what exports.
         col.addSpacing(4)
-        col.addWidget(self._section_header("SEQUENCER · 16 STEPS"))
-        self.step_grid = StepGrid(steps=N_STEPS)
-        self.step_grid.setActive(False)
-        self.step_grid.stepToggled.connect(self._on_step_toggled)
-        col.addWidget(self.step_grid)
+        col.addWidget(self._section_header("SAMPLE EDITOR"))
+        self.wave_editor = WaveformEditor()
+        self.wave_editor.boundsChanged.connect(self._on_wave_bounds_changed)
+        self.wave_editor.editCommitted.connect(self._on_wave_edit_committed)
+        col.addWidget(self.wave_editor, 1)
 
-        col.addStretch(1)
+        col.addStretch(0)
         return col
 
     def _make_sample_mode_toggle(self) -> QWidget:
@@ -1281,16 +1283,14 @@ class MainWindow(QMainWindow):
         self._apply_loudness_gains()
         loaded = instrument.loaded_notes()
         self._octave = 0
-        # Fresh instrument → reset sample choice, selection, and step patterns.
+        # Fresh instrument → reset sample choice and selection.
         self._sample_choice = {}
         self._selected_key = None
-        self._patterns = {}
         self.piano.set_selected(None)
         self.active_led.setOn(False)
         self.active_lbl.setText("—")
         self._update_sample_selector()
-        self.step_grid.setActive(False)
-        self.step_grid.setPattern([False] * N_STEPS)
+        self.wave_editor.clear()
         self._refresh_octave_view()
         if loaded:
             self._enable_instrument_actions(True)
@@ -1351,13 +1351,11 @@ class MainWindow(QMainWindow):
         self._octave = 0
         self._sample_choice = {}
         self._selected_key = None
-        self._patterns = {}
         self.piano.set_selected(None)
         self.active_led.setOn(False)
         self.active_lbl.setText("—")
         self._update_sample_selector()
-        self.step_grid.setActive(False)
-        self.step_grid.setPattern([False] * N_STEPS)
+        self.wave_editor.clear()
         self._refresh_octave_view()
         loaded = bool(self._instrument.loaded_notes())
         self._enable_instrument_actions(loaded)
@@ -1798,9 +1796,7 @@ class MainWindow(QMainWindow):
         seg = self._active_segment()
         if seg is not None:
             self._load_settings_into_controls(self._settings_for(seg))
-        pattern = self._patterns.setdefault(cluster_idx, [False] * N_STEPS)
-        self.step_grid.setActive(True)
-        self.step_grid.setPattern(pattern)
+        self._show_active_in_editor()
 
     def _update_sample_selector(self) -> None:
         """Refresh the ◀ N/M ▶ readout for the selected key. In VEL LAYER mode the
@@ -1833,21 +1829,40 @@ class MainWindow(QMainWindow):
         idx = (self._sample_choice.get(key, 0) + delta) % n
         self._sample_choice[key] = idx
         self._update_sample_selector()
-        # Load the newly chosen sample's settings into the controls.
+        # Load the newly chosen sample's settings into the controls + editor.
         seg = self._active_segment()
         if seg is not None:
             self._load_settings_into_controls(self._settings_for(seg))
+        self._show_active_in_editor()
         # Audition exactly the arrow-chosen sample, regardless of sample-pick
         # mode (which would otherwise pick by velocity or at random on a key press).
         self._play_selected_sample(key, force_idx=idx)
 
-    @Slot(int)
-    def _on_step_toggled(self, step: int) -> None:
-        if self._selected_key is None:
+    # ============================================================
+    # per-sample waveform editor
+    # ============================================================
+
+    def _show_active_in_editor(self) -> None:
+        """Load the active (arrow-chosen) sample into the waveform editor."""
+        self.wave_editor.set_segment(self._active_segment(),
+                                     self._instrument.sample_rate)
+
+    def _on_wave_bounds_changed(self, start: int, end: int) -> None:
+        """Live drag: retrim the active sample so playback/export follow instantly."""
+        seg = self._active_segment()
+        if seg is not None:
+            P.reslice_segment(seg, start, end)
+
+    def _on_wave_edit_committed(self, start: int, end: int) -> None:
+        """Drag released: finalize the trim and audition the result."""
+        seg = self._active_segment()
+        if seg is None:
             return
-        pattern = self._patterns.setdefault(self._selected_key, [False] * N_STEPS)
-        pattern[step] = not pattern[step]
-        self.step_grid.setPattern(pattern)
+        P.reslice_segment(seg, start, end)
+        self._update_sample_selector()
+        if self._selected_key is not None:
+            idx = self._sample_choice.get(self._selected_key, 0)
+            self._play_selected_sample(self._selected_key, force_idx=idx)
 
     @Slot(int)
     def _on_note_released(self, note_index: int) -> None:

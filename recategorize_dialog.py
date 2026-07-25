@@ -190,18 +190,6 @@ class RecategorizeDialog(QDialog):
         header.setObjectName("dialogHeader")
         root.addWidget(header)
 
-        sub = QLabel(
-            "SAMPLES: drag them between cluster headers to recategorize (Shift/Ctrl-"
-            "click for several). CLUSTERS: click a header's 'Assign to Key', then "
-            "PRESS the key you want it on (A W S E D F … piano layout; Z / X = octave "
-            "down / up, Esc cancels) — onto an occupied key it SWAPS the two. "
-            "UNASSIGNED = no key/not exported; ✕ REMOVE = dropped. Click a sample to "
-            "hear it. Nothing changes until APPLY."
-        )
-        sub.setWordWrap(True)
-        sub.setObjectName("dialogSubtle")
-        root.addWidget(sub)
-
         # Assign every segment a stable id.
         next_id = 0
         seg_of_key: dict[int, list[int]] = {}
