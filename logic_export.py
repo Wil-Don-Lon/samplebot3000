@@ -401,3 +401,182 @@ def write_exs_kit(
     if progress:
         progress("done", 1.0)
     return exs_path
+
+
+# ---------------------------------------------------------------------------
+# Round-robin writer — the classic ("108-byte zone") EXS format
+#
+# The modern format above never rotates multiple samples on one key (its factory
+# kits are one-sample-per-key). Logic's *classic* EXS format does: several
+# full-velocity zones sharing a group round-robin. It's an older, simpler layout
+# (40-byte instrument, 108-byte zones, 120-byte groups, 592-byte samples, a
+# 304-byte params block, NO output/bplist blocks) and its block header uses a
+# plain type byte (no 0x40). Templated verbatim from Logic's "Electronic Snare
+# D1 6" (a 2-way full-velocity round-robin), patching per-instance fields.
+# ---------------------------------------------------------------------------
+
+def _block_rr(block_type: int, index: int, name: str, content: bytes) -> bytes:
+    """Classic-format block header: like _block but the type byte is plain (the
+    modern format ORs it with 0x40; the classic format does not)."""
+    head = bytes((1, 1, 0, block_type & 0x3F))
+    head += _le32(len(content)) + _le32(index) + _le32(0) + _MAGIC
+    head += _ascii(name, 64)
+    return head + content
+
+
+def _zone_rr_content(midi_note: int, group_index: int, sample_index: int,
+                     length: int, alt_index: int) -> bytes:
+    b = bytearray(_T.ZONE_RR_TMPL)
+    # opts: the factory round-robin alternates carry 0x00 on the first zone of a
+    # key and 0x08 on the rest — replicate that so Logic treats them as a cycle.
+    b[0] = 0x00 if alt_index == 0 else 0x08
+    root = int(np.clip(midi_note, 0, 127))
+    b[1] = root                                  # root key
+    b[6] = root                                  # key low  (single key)
+    b[7] = root                                  # key high
+    b[9] = 0                                      # full velocity range
+    b[10] = 127
+    _put(b, 16, _le32(max(0, length)))           # sample end (frames)
+    _put(b, 24, _le32(max(0, length)))
+    _put(b, 88, _le32(group_index))
+    _put(b, 92, _le32(sample_index))
+    return bytes(b)
+
+
+def _sample_rr_content(length: int, sample_rate: int, bit_depth: int,
+                       file_size: int, data_start: int, dir_path: str,
+                       file_name: str) -> bytes:
+    b = bytearray(_T.SAMPLE_RR_TMPL)
+    _put(b, 0, _le32(data_start))
+    _put(b, 4, _le32(length))
+    _put(b, 8, _le32(sample_rate))
+    _put(b, 12, _le32(bit_depth))
+    _put(b, 16, _le32(1))                        # channels (mono)
+    _put(b, 20, _le32(1))
+    _put(b, 24, _le32(1))
+    _put(b, 28, b"EVAW")                         # "WAVE" 4cc, byte-reversed
+    _put(b, 32, _le32(file_size))
+    _put(b, 80, _ascii(dir_path, 256))
+    _put(b, 336, _ascii(file_name, len(_T.SAMPLE_RR_TMPL) - 336))
+    return bytes(b)
+
+
+def write_exs_kit_rr(
+    kit_name: str,
+    notes: dict[int, list],
+    key_label: Callable[[int], str],
+    sample_rate: int,
+    dest_dir: Path,
+    base_note: int = BASE_MIDI_NOTE,
+    process_audio: Optional[Callable[[object, np.ndarray], np.ndarray]] = None,
+    progress: Optional[Callable[[str, float], None]] = None,
+) -> Path:
+    """Write a round-robin kit in the classic EXS format: each key's samples
+    become full-velocity zones in that key's own group, so Logic cycles them.
+
+    `process_audio(seg, raw)` bakes the app's per-sample effects into the WAVs
+    (same as the modern writer). Returns the written .exs path.
+    """
+    # Collect, per key, its samples soft->loud (the round-robin order).
+    valid: dict[int, list] = {}
+    for key in sorted(notes):
+        segs = [s for s in notes[key] if getattr(s, "audio", None) is not None
+                and np.asarray(s.audio).size > 0]
+        if segs:
+            valid[key] = sorted(segs, key=lambda s: getattr(s, "rms", 0.0))
+    if not valid:
+        raise ValueError("nothing to export — the kit has no samples")
+
+    _processed: dict[int, np.ndarray] = {}
+    def aud(seg) -> np.ndarray:
+        raw = np.asarray(seg.audio, dtype=np.float32).ravel()
+        if process_audio is None:
+            return raw
+        k = id(seg.audio)
+        if k not in _processed:
+            _processed[k] = np.asarray(process_audio(seg, raw),
+                                       dtype=np.float32).ravel()
+        return _processed[k]
+
+    safe_kit = sanitize_name(kit_name)
+    kit_dir = Path(dest_dir).resolve()
+    kit_dir.mkdir(parents=True, exist_ok=True)
+    dir_path = str(kit_dir)
+    bit_depth, subtype = 24, "PCM_24"
+
+    # One group per key; each group holds that key's full-velocity alternates.
+    # (zone info, group index, alt index within the group) plus per-key group name.
+    zone_infos: list[tuple] = []   # (audio, midi_note, group_index, alt_index)
+    group_names: list[str] = []
+    used: set[str] = set()
+    zone_names: list[str] = []
+    for gidx, (key, segs) in enumerate(valid.items()):
+        label = sanitize_name(key_label(key), f"Key{key}")
+        group_names.append(label)
+        midi_note = int(np.clip(base_note + key, 0, 127))
+        n = len(segs)
+        for i, seg in enumerate(segs):
+            base = label if n == 1 else f"{label}_{i + 1}"
+            zone_names.append(_unique(base, used))
+            zone_infos.append((aud(seg), midi_note, gidx, i))
+
+    # Dedup WAVs by audio identity, write them, gather per-sample metadata.
+    sample_of_zone: list[int] = []
+    unique_audio: list[np.ndarray] = []
+    unique_name: list[str] = []
+    by_id: dict[int, int] = {}
+    for (audio, _mn, _g, _a), zname in zip(zone_infos, zone_names):
+        aid = id(audio)
+        si = by_id.get(aid)
+        if si is None:
+            si = len(unique_audio)
+            by_id[aid] = si
+            unique_audio.append(audio)
+            unique_name.append(zname)
+        sample_of_zone.append(si)
+
+    sample_meta = []
+    total = len(unique_audio)
+    for si, audio in enumerate(unique_audio):
+        if progress:
+            progress(f"writing {unique_name[si]}.wav", si / max(1, total) * 0.7)
+        wav_path = kit_dir / f"{safe_kit} - {unique_name[si]}.wav"
+        a = np.clip(np.asarray(audio, dtype=np.float32).ravel(), -1.0, 1.0)
+        sf.write(str(wav_path), a, int(sample_rate), subtype=subtype)
+        sample_meta.append((int(a.shape[0]), int(wav_path.stat().st_size),
+                            _wav_data_offset(wav_path), wav_path.name))
+
+    if progress:
+        progress("building instrument", 0.8)
+
+    n_zones = len(zone_infos)
+    n_groups = len(group_names)
+    n_samples = len(unique_audio)
+
+    out = bytearray()
+    instr = bytearray(_T.INSTR_RR_TMPL)
+    _put(instr, 4, _le32(n_zones))
+    _put(instr, 8, _le32(n_groups))
+    _put(instr, 12, _le32(n_samples))
+    _put(instr, 16, _le32(1))
+    out += _block_rr(_TYPE_INSTRUMENT, 0, safe_kit, bytes(instr))
+    for i, (audio, midi_note, gidx, alt) in enumerate(zone_infos):
+        length = sample_meta[sample_of_zone[i]][0]
+        out += _block_rr(_TYPE_ZONE, i, zone_names[i],
+                         _zone_rr_content(midi_note, gidx, sample_of_zone[i],
+                                          length, alt))
+    for gi, gname in enumerate(group_names):
+        out += _block_rr(_TYPE_GROUP, gi, gname, bytes(_T.GROUP_RR_TMPL))
+    for si in range(n_samples):
+        length, file_size, data_start, file_name = sample_meta[si]
+        out += _block_rr(_TYPE_SAMPLE, si, unique_name[si],
+                         _sample_rr_content(length, int(sample_rate), bit_depth,
+                                            file_size, data_start, dir_path,
+                                            file_name))
+    out += _block_rr(_TYPE_PARAMS, 0, "Default Param", bytes(_T.PARAMS_RR_TMPL))
+
+    exs_path = kit_dir / f"{safe_kit}.exs"
+    exs_path.write_bytes(bytes(out))
+    if progress:
+        progress("done", 1.0)
+    return exs_path

@@ -1458,14 +1458,24 @@ class MainWindow(QMainWindow):
         # Logic kit sounds like the app. Velocity and its live darkening lowpass
         # stay live (the exported kit responds to how hard you play).
         process_audio = self._make_export_processor()
+        prog = lambda msg, frac: self._on_progress(f"export: {msg}", frac)
         try:
-            zones = logic_export.instrument_to_zonespecs(
-                self._instrument.notes, key_label=self._current_key_label,
-                round_robin=round_robin, process_audio=process_audio)
-            exs_path = logic_export.write_exs_kit(
-                name, zones, self._instrument.sample_rate, dest,
-                progress=lambda msg, frac: self._on_progress(f"export: {msg}", frac),
-            )
+            if round_robin:
+                # RANDOM → classic-format round-robin kit (Logic cycles a key's
+                # full-velocity alternates). This is a different EXS format than
+                # the velocity-split path below.
+                exs_path = logic_export.write_exs_kit_rr(
+                    name, self._instrument.notes,
+                    key_label=self._current_key_label,
+                    sample_rate=self._instrument.sample_rate, dest_dir=dest,
+                    process_audio=process_audio, progress=prog)
+            else:
+                # VEL LAYER → modern-format velocity-split kit.
+                zones = logic_export.instrument_to_zonespecs(
+                    self._instrument.notes, key_label=self._current_key_label,
+                    round_robin=False, process_audio=process_audio)
+                exs_path = logic_export.write_exs_kit(
+                    name, zones, self._instrument.sample_rate, dest, progress=prog)
         except Exception as exc:  # noqa: BLE001
             self.status.setText(f"export failed: {exc}")
             return

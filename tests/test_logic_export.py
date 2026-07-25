@@ -161,27 +161,22 @@ def test_exs_roundtrip():
 
 
 def test_exs_round_robin():
-    # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. Modern round-robin: a key's
-    # samples all cover FULL velocity (so they overlap on the key) and the i-th
-    # sample of every key goes in group i, so a key's samples land in DIFFERENT
-    # groups. Logic rotates overlapping same-key zones only across groups (same-
-    # group overlap just layers). No chain / cycle flag → polyphonic rotation.
+    # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. write_exs_kit_rr emits the
+    # CLASSIC EXS format (the one that actually rotates): each key's samples become
+    # full-velocity zones sharing that key's own group; Logic cycles them. Classic
+    # blocks are shorter (108-byte zones, 40-byte instrument) with a plain type
+    # byte, and there are no output/bplist blocks.
     notes = {
         0: [_make_seg(0.2), _make_seg(0.05), _make_seg(0.4)],
         5: [_make_seg(0.3), _make_seg(0.1)],
         7: [_make_seg(0.15)],
     }
     labels = {0: "KICK", 5: "SNR", 7: "HH"}
-    zones = lx.instrument_to_zonespecs(
-        notes, key_label=lambda k: labels[k], round_robin=True)
-
-    # One zone per sample; every zone full-velocity. Max depth is 3 -> groups 0,1,2.
-    assert len(zones) == 6
-    assert sorted(set(z.group_index for z in zones)) == [0, 1, 2]
-    assert all(z.vel_low == 1 and z.vel_high == 127 for z in zones)
 
     with tempfile.TemporaryDirectory() as d:
-        exs_path = lx.write_exs_kit("RR Kit", zones, 44100, Path(d))
+        exs_path = lx.write_exs_kit_rr(
+            "RR Kit", notes, key_label=lambda k: labels[k],
+            sample_rate=44100, dest_dir=Path(d))
         blocks = _parse_blocks(exs_path.read_bytes())
         by_type = {}
         for b in blocks:
@@ -191,45 +186,41 @@ def test_exs_round_robin():
         samples = by_type[lx._TYPE_SAMPLE]
         zone_blocks = by_type[lx._TYPE_ZONE]
 
-        # One group per RR position (max depth 3); one sample + zone per sample.
+        # Classic layout: 108-byte zones; one group PER KEY (3); a sample/zone
+        # per sample (6); no output blocks.
+        assert len(zone_blocks[0][3]) == 108, "classic zones are 108 bytes"
         assert len(groups) == 3 and len(samples) == 6 and len(zone_blocks) == 6
+        assert lx._TYPE_OUTPUT not in by_type, "classic format has no output blocks"
         ic = by_type[lx._TYPE_INSTRUMENT][0][3]
-        n_zones, n_groups, n_samples, _ = struct.unpack("<IIII", ic[4:20])
-        assert (n_zones, n_groups, n_samples) == (6, 3, 6)
+        assert len(ic) == 40, "classic instrument block is 40 bytes"
+        n_zones, n_groups, n_samples, n_params = struct.unpack("<IIII", ic[4:20])
+        assert (n_zones, n_groups, n_samples, n_params) == (6, 3, 6, 1)
 
-        # Every group must be a clean factory group: no chain (@80 = -1), no cycle
-        # flag (@90 = 0), polyphonic (@3 bit0), max voices (@2 = 0).
-        for _t, _i, _n, gc in groups:
-            assert struct.unpack("<i", gc[80:84])[0] == -1, "group must not chain"
-            assert gc[90] == 0, "group must not set the cycle flag"
-            assert gc[2] == 0 and (gc[3] & 1), "group must be polyphonic / max voices"
-
-        # A key's zones are full-velocity, distinct samples, and — crucially —
-        # spread across DIFFERENT groups (group_index = the sample's RR position).
+        # A key's alternates share ONE group, at FULL velocity, with distinct
+        # samples; the opts byte is 0 on the first alternate and 8 on the rest
+        # (the factory round-robin marker). Different keys use different groups.
         by_note = {}
         note_group = {}
+        note_opts = {}
         for _t, _i, _n, c in zone_blocks:
-            assert c[9] <= 1 and c[10] == 127, "round-robin zones are full-velocity"
-            note_group.setdefault(c[1], []).append(struct.unpack("<I", c[88:92])[0])
+            assert c[6] == c[7] == c[1], "classic RR zone spans its single key"
+            assert c[9] == 0 and c[10] == 127, "RR zones are full-velocity"
+            note_group.setdefault(c[1], set()).add(struct.unpack("<I", c[88:92])[0])
             by_note.setdefault(c[1], []).append(struct.unpack("<I", c[92:96])[0])
-        # key 0->MIDI 36 (3 samples), 5->41 (2), 7->43 (1)
+            note_opts.setdefault(c[1], []).append(c[0])
+        # key 0->MIDI 36 (3), 5->41 (2), 7->43 (1)
         assert sorted(by_note) == [36, 41, 43]
         assert sorted(len(v) for v in by_note.values()) == [1, 2, 3]
+        assert all(len(g) == 1 for g in note_group.values()), "a key = one group"
+        assert len({next(iter(g)) for g in note_group.values()}) == 3
         for note, sids in by_note.items():
-            assert len(set(sids)) == len(sids), f"note {note} zones reuse a sample"
-            # A multi-sample key must span as many DISTINCT groups as it has samples.
-            gs = note_group[note]
-            assert sorted(gs) == list(range(len(gs))), f"note {note} groups not 0..n-1"
-        # Group i holds the i-th sample of every deep-enough key: group 0 has all
-        # three notes, group 2 only the 3-sample key.
-        g_notes = {}
-        for _t, _i, _n, c in zone_blocks:
-            g_notes.setdefault(struct.unpack("<I", c[88:92])[0], set()).add(c[1])
-        assert g_notes[0] == {36, 41, 43} and g_notes[2] == {36}
+            assert len(set(sids)) == len(sids), f"note {note} reuses a sample"
+            assert note_opts[note][0] == 0x00
+            assert all(o == 0x08 for o in note_opts[note][1:])
 
         kit_dir = exs_path.parent
         for _t, _i, _n, c in samples:
-            fname = c[336:600].split(b"\x00", 1)[0].decode("ascii")
+            fname = c[336:592].split(b"\x00", 1)[0].decode("ascii")
             assert (kit_dir / fname).exists()
 
 
