@@ -1459,18 +1459,15 @@ class MainWindow(QMainWindow):
         # stay live (the exported kit responds to how hard you play).
         process_audio = self._make_export_processor()
         prog = lambda msg, frac: self._on_progress(f"export: {msg}", frac)
-        # Hi-hat choke (from the reference instrument): in the GM/AUTO layout the
-        # hat keys are known, so their groups join exclusive class 1 — closed and
-        # pedal hats cut the open hat's ring. Every other key keeps full
-        # polyphony and full release. Frequency-sorted kits have no hat labels,
-        # so no choke is applied there.
-        choke_notes = None
-        if self._result_is_classify:
-            choke_notes = {
-                logic_export.BASE_MIDI_NOTE + k
-                for k, fam, _lab in DRUM_KEYMAP if fam == "hat"
-                and self._instrument.notes.get(k)
-            }
+        # Hi-hat choke (from the reference instrument): F#1/G#1/A#1 — the GM hat
+        # notes 42/44/46 — ALWAYS join exclusive class 1 with mono voices, so
+        # closed/pedal hats cut the open hat's ring. Those slots are hats in
+        # every layout this app produces (and per the user: "they will typically
+        # always be high hats"). Every other key keeps full polyphony + release.
+        choke_notes = {
+            logic_export.BASE_MIDI_NOTE + k
+            for k, fam, _lab in DRUM_KEYMAP if fam == "hat"
+        }
         try:
             zones = logic_export.instrument_to_zonespecs(
                 self._instrument.notes, key_label=self._current_key_label,
