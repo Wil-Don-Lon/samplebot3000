@@ -53,6 +53,7 @@ class WaveformEditor(QWidget):
         self._end = 0
         self._drag: Optional[str] = None          # "start" | "end" | None
         self._hover: Optional[str] = None
+        self._preview: Optional[tuple] = None      # (start,end) autotrim proposal
 
     # ---------- public API ----------
 
@@ -72,6 +73,13 @@ class WaveformEditor(QWidget):
         self._start = int(getattr(seg, "src_start", 0))
         self._end = int(getattr(seg, "src_end", self._n))
         self._env = self._build_envelope(src)
+        self._preview = None
+        self.update()
+
+    def set_preview(self, start: Optional[int], end: Optional[int] = None) -> None:
+        """Show a proposed (autotrim) start/end as a dashed overlay, without
+        committing. Pass None to clear the overlay."""
+        self._preview = None if start is None else (int(start), int(end))
         self.update()
 
     def clear(self) -> None:
@@ -148,6 +156,14 @@ class WaveformEditor(QWidget):
         # Zero line.
         p.setPen(QPen(GRID, 1))
         p.drawLine(int(r.left()), int(mid), int(r.right()), int(mid))
+
+        # Autotrim preview: dashed cyan lines at the proposed start/end.
+        if self._preview is not None:
+            pen = QPen(QColor("#5fd0ff"), 2, Qt.DashLine)
+            p.setPen(pen)
+            for s in self._preview:
+                px = self._x_of(int(s))
+                p.drawLine(int(px), int(r.top()), int(px), int(r.bottom()))
 
         # Handles.
         for x, which in ((sx, "start"), (ex, "end")):

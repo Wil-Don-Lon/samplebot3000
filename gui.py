@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFileDialog, QSlider, QProgressBar,
     QFrame, QSizePolicy, QButtonGroup, QScrollArea,
-    QApplication, QLineEdit, QDialog, QListWidget, QListWidgetItem,
+    QApplication, QLineEdit, QDialog, QListWidget, QListWidgetItem, QMessageBox,
 )
 
 import pipeline as P
@@ -780,6 +780,7 @@ class MainWindow(QMainWindow):
             "TRANSIENT SENS",
             self._make_sens_slider(),
             self.sens_value_lbl,
+            label_attr="sens_label",
         ))
 
         # Noise gate: peak-based, drops whole segments below this threshold
@@ -800,7 +801,8 @@ class MainWindow(QMainWindow):
         self.trim_value_lbl.setObjectName("valueLabel")
         self.trim_value_lbl.setMinimumWidth(50)
         self.trim_slider.valueChanged.connect(self._on_trim_changed)
-        col.addLayout(self._slider_row("TRIM THRESHOLD", self.trim_slider, self.trim_value_lbl))
+        col.addLayout(self._slider_row("TRIM THRESHOLD", self.trim_slider,
+                                       self.trim_value_lbl, label_attr="trim_label"))
 
         # Clipper: when on, a played sample ends at the next transient; when off
         # it runs to the trim-threshold decay or the sample-length cap. Default ON
@@ -842,7 +844,30 @@ class MainWindow(QMainWindow):
         # sample; drag the two ends to retrim the start or elongate the tail into
         # the padded runway. Edits change what plays AND what exports.
         col.addSpacing(4)
-        col.addWidget(self._section_header("SAMPLE EDITOR"))
+        editor_head = QHBoxLayout()
+        editor_head.addWidget(self._section_header("SAMPLE EDITOR"))
+        editor_head.addStretch(1)
+        # AUTOTRIM: arm it, then dial TRANSIENT SENS / TRIM THRESHOLD (they light
+        # up and the editor previews the result on the current sample); APPLY TO
+        # ALL commits the retrim to every sample.
+        self.autotrim_btn = QPushButton("AUTOTRIM")
+        self.autotrim_btn.setObjectName("octaveBtn")
+        self.autotrim_btn.setCheckable(True)
+        self.autotrim_btn.setEnabled(False)
+        self.autotrim_btn.toggled.connect(self._on_autotrim_toggled)
+        editor_head.addWidget(self.autotrim_btn)
+        self.autotrim_apply_btn = QPushButton("APPLY TO ALL")
+        self.autotrim_apply_btn.setObjectName("octaveBtn")
+        self.autotrim_apply_btn.setVisible(False)
+        self.autotrim_apply_btn.clicked.connect(self._apply_autotrim_all)
+        editor_head.addWidget(self.autotrim_apply_btn)
+        col.addLayout(editor_head)
+
+        self.autotrim_hint = QLabel("")
+        self.autotrim_hint.setObjectName("dialogSubtle")
+        self.autotrim_hint.setWordWrap(True)
+        col.addWidget(self.autotrim_hint)
+
         self.wave_editor = WaveformEditor()
         self.wave_editor.boundsChanged.connect(self._on_wave_bounds_changed)
         self.wave_editor.editCommitted.connect(self._on_wave_edit_committed)
@@ -1151,11 +1176,14 @@ class MainWindow(QMainWindow):
         row.addWidget(widget, 1)
         return w
 
-    def _slider_row(self, label_text: str, slider: QSlider, value_lbl: QLabel) -> QHBoxLayout:
+    def _slider_row(self, label_text: str, slider: QSlider, value_lbl: QLabel,
+                    label_attr: Optional[str] = None) -> QHBoxLayout:
         row = QHBoxLayout()
         lbl = QLabel(label_text)
         lbl.setObjectName("controlLabel")
         lbl.setMinimumWidth(110)
+        if label_attr:                       # keep a handle so it can be highlighted
+            setattr(self, label_attr, lbl)
         row.addWidget(lbl)
         row.addWidget(slider, 1)
         row.addWidget(value_lbl)
@@ -1335,6 +1363,9 @@ class MainWindow(QMainWindow):
     def _enable_instrument_actions(self, enabled: bool) -> None:
         self.recat_btn.setEnabled(enabled)
         self.export_btn.setEnabled(enabled)
+        self.autotrim_btn.setEnabled(enabled)
+        if not enabled and self.autotrim_btn.isChecked():
+            self.autotrim_btn.setChecked(False)
 
     def _refresh_after_instrument_change(self, status_text: str) -> None:
         """Shared reset + redraw after the instrument's key mapping changes
@@ -1846,6 +1877,8 @@ class MainWindow(QMainWindow):
         """Load the active (arrow-chosen) sample into the waveform editor."""
         self.wave_editor.set_segment(self._active_segment(),
                                      self._instrument.sample_rate)
+        if getattr(self, "autotrim_btn", None) and self.autotrim_btn.isChecked():
+            self._autotrim_preview()   # keep the preview on the newly-shown sample
 
     def _on_wave_bounds_changed(self, start: int, end: int) -> None:
         """Live drag: retrim the active sample so playback/export follow instantly."""
@@ -1863,6 +1896,69 @@ class MainWindow(QMainWindow):
         if self._selected_key is not None:
             idx = self._sample_choice.get(self._selected_key, 0)
             self._play_selected_sample(self._selected_key, force_idx=idx)
+
+    # ---------- autotrim (batch) ----------
+
+    def _autotrim_params(self) -> tuple[float, float]:
+        """The two generation knobs, read live: (sensitivity 0..1, trim dB)."""
+        return (self.sens_slider.value() / 100.0,
+                self._trim_db_from_slider(self.trim_slider.value()))
+
+    def _on_autotrim_toggled(self, on: bool) -> None:
+        """Arm/disarm autotrim: light the two knobs, live-preview on the current
+        sample as they're tuned, and reveal APPLY TO ALL."""
+        self.autotrim_apply_btn.setVisible(on)
+        hl = "color:#ff8a1e; font-weight:bold;" if on else ""
+        self.sens_label.setStyleSheet(hl)
+        self.trim_label.setStyleSheet(hl)
+        self.autotrim_hint.setText(
+            "Tune TRANSIENT SENS + TRIM THRESHOLD (cyan lines preview the cut on "
+            "this sample), then APPLY TO ALL." if on else "")
+        if on:
+            self.sens_slider.valueChanged.connect(self._autotrim_preview)
+            self.trim_slider.valueChanged.connect(self._autotrim_preview)
+            self._autotrim_preview()
+        else:
+            for sl in (self.sens_slider, self.trim_slider):
+                try:
+                    sl.valueChanged.disconnect(self._autotrim_preview)
+                except (TypeError, RuntimeError):
+                    pass
+            self.wave_editor.set_preview(None)
+
+    def _autotrim_preview(self, *_args) -> None:
+        """Overlay the proposed autotrim bounds on the active sample."""
+        seg = self._active_segment()
+        if seg is None:
+            self.wave_editor.set_preview(None)
+            return
+        P.ensure_source(seg)
+        start, end = P.autotrim_bounds(seg.source, *self._autotrim_params())
+        self.wave_editor.set_preview(start, end)
+
+    def _apply_autotrim_all(self) -> None:
+        """Retrim every sample (start→transient, end→next transient) with the
+        current knobs, after a confirm."""
+        all_segs = [s for segs in self._instrument.notes.values() for s in segs]
+        all_segs += list(self._instrument.unassigned)
+        if not all_segs:
+            return
+        sens, trim = self._autotrim_params()
+        resp = QMessageBox.question(
+            self, "Autotrim all samples",
+            f"Retrim all {len(all_segs)} samples — start snug to the transient, "
+            f"end out to the next transient — using the current TRANSIENT SENS "
+            f"and TRIM THRESHOLD?\n\nYou can still hand-tune any sample afterward.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if resp != QMessageBox.Yes:
+            return
+        for seg in all_segs:
+            P.ensure_source(seg)
+            P.reslice_segment(seg, *P.autotrim_bounds(seg.source, sens, trim))
+        self.autotrim_btn.setChecked(False)     # disarm (clears preview/highlights)
+        self._show_active_in_editor()
+        self._update_sample_selector()
+        self.status.setText(f"autotrimmed {len(all_segs)} samples")
 
     @Slot(int)
     def _on_note_released(self, note_index: int) -> None:
@@ -1906,6 +2002,10 @@ class MainWindow(QMainWindow):
         if not self._midi.is_connected():
             self._midi.connect_first()
         name = self._midi.port_name
+        if name:
+            # The OS names Logic's virtual MIDI port after whichever Logic is
+            # installed ("Logic Pro Trial Virtual Out"); show it as plain Logic Pro.
+            name = name.replace("Logic Pro Trial", "Logic Pro")
         self.midi_lbl.setText(f"MIDI ● {name}" if name else "MIDI: —")
 
     # ============================================================

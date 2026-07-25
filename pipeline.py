@@ -413,6 +413,45 @@ def ensure_source(seg: "Segment") -> None:
         seg.src_end = int(seg.source.shape[0])
 
 
+def autotrim_bounds(source: np.ndarray, sensitivity: float,
+                    trim_threshold_db: float) -> tuple[int, int]:
+    """Propose editor bounds for a padded `source` buffer: snug the START up
+    against the hit's transient and push the END out to the next transient (or
+    the tail falling silent if there's no next hit).
+
+    Uses the same two knobs that generated the kit — `trim_threshold_db` finds
+    the leading edge / tail, `sensitivity` finds the next transient — so results
+    track the user's mental model instead of arbitrary constants."""
+    src = np.asarray(source, dtype=np.float32).ravel()
+    n = int(src.shape[0])
+    if n == 0:
+        return (0, 0)
+    thr = 10.0 ** (float(trim_threshold_db) / 20.0)
+    amp = np.abs(src)
+    above = np.nonzero(amp >= thr)[0]
+    if above.size == 0:
+        return (0, n)
+
+    onsets = detect_onsets(src, sensitivity)
+    onset_samps = (onsets * TARGET_SR).astype(np.int64) if len(onsets) else \
+        np.array([], dtype=np.int64)
+    main = int(onset_samps[0]) if onset_samps.size else int(above[0])
+
+    # START: first supra-threshold sample from just before the main transient, so
+    # we sit right on the attack without eating a previous hit's tail in the pad.
+    search = max(0, main - int(0.03 * TARGET_SR))
+    local = np.nonzero(amp[search:] >= thr)[0]
+    left = search + int(local[0]) if local.size else main
+
+    # END: the next transient after this hit; else the tail going silent.
+    gap = int((MIN_ONSET_GAP_S + 0.02) * TARGET_SR)
+    nxt = onset_samps[onset_samps > main + gap]
+    right = int(nxt[0]) if nxt.size else int(above[-1]) + 1
+
+    right = min(n, max(left + MIN_SEGMENT_SAMPLES, right))
+    return (left, right)
+
+
 def reslice_segment(seg: "Segment", start: int, end: int) -> None:
     """Retrim/elongate a segment to source[start:end] (indices into seg.source),
     re-materializing `audio` (peak-normalized, like detection) plus the derived
