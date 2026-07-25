@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 
 from pipeline import (
     run_pipeline, assign_keys_to_clusters, build_instrument_drumkeys_gm,
-    Instrument, NOTE_NAMES, NOTE_NAMES_12, MAX_KEYS, KEY_CAP_LABEL,
+    Instrument, NOTE_NAMES, NOTE_NAMES_12, MAX_KEYS, KEY_CAP_LABEL, DRUM_KEYMAP,
 )
 from audio_engine import AudioEngine
 from piano_widget import PianoKeyboardWidget
@@ -1459,23 +1459,25 @@ class MainWindow(QMainWindow):
         # stay live (the exported kit responds to how hard you play).
         process_audio = self._make_export_processor()
         prog = lambda msg, frac: self._on_progress(f"export: {msg}", frac)
+        # Hi-hat choke (from the reference instrument): in the GM/AUTO layout the
+        # hat keys are known, so their groups join exclusive class 1 — closed and
+        # pedal hats cut the open hat's ring. Every other key keeps full
+        # polyphony and full release. Frequency-sorted kits have no hat labels,
+        # so no choke is applied there.
+        choke_notes = None
+        if self._result_is_classify:
+            choke_notes = {
+                logic_export.BASE_MIDI_NOTE + k
+                for k, fam, _lab in DRUM_KEYMAP if fam == "hat"
+                and self._instrument.notes.get(k)
+            }
         try:
-            if round_robin:
-                # RANDOM → classic-format round-robin kit (Logic cycles a key's
-                # full-velocity alternates). This is a different EXS format than
-                # the velocity-split path below.
-                exs_path = logic_export.write_exs_kit_rr(
-                    name, self._instrument.notes,
-                    key_label=self._current_key_label,
-                    sample_rate=self._instrument.sample_rate, dest_dir=dest,
-                    process_audio=process_audio, progress=prog)
-            else:
-                # VEL LAYER → modern-format velocity-split kit.
-                zones = logic_export.instrument_to_zonespecs(
-                    self._instrument.notes, key_label=self._current_key_label,
-                    round_robin=False, process_audio=process_audio)
-                exs_path = logic_export.write_exs_kit(
-                    name, zones, self._instrument.sample_rate, dest, progress=prog)
+            zones = logic_export.instrument_to_zonespecs(
+                self._instrument.notes, key_label=self._current_key_label,
+                round_robin=round_robin, process_audio=process_audio)
+            exs_path = logic_export.write_exs_kit(
+                name, zones, self._instrument.sample_rate, dest,
+                choke_notes=choke_notes, progress=prog)
         except Exception as exc:  # noqa: BLE001
             self.status.setText(f"export failed: {exc}")
             return
@@ -1483,7 +1485,8 @@ class MainWindow(QMainWindow):
         where = "Logic → Sampler → instrument menu" if into_logic else str(exs_path.parent)
         layout = "round-robin" if round_robin else "velocity-split"
         loud = "  ·  equal-loudness" if self._equal_loudness else ""
-        self.status.setText(f"exported '{name}'  ·  {layout}{loud}  ·  {where}")
+        choked = "  ·  hat choke" if choke_notes else ""
+        self.status.setText(f"exported '{name}'  ·  {layout}{loud}{choked}  ·  {where}")
 
     def _make_export_processor(self):
         """Return process_audio(seg, raw) that bakes a sample's stored playback

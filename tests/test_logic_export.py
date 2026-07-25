@@ -82,19 +82,20 @@ def test_exs_roundtrip():
         group_blocks = by_type[lx._TYPE_GROUP]
         sample_blocks = by_type[lx._TYPE_SAMPLE]
         param_blocks = by_type[lx._TYPE_PARAMS]
-        output_blocks = by_type[lx._TYPE_OUTPUT]
 
         # Two keys -> two groups (one group per key; a kit never uses one group).
         assert len(inst) == 1 and len(group_blocks) == 2 and len(param_blocks) == 1
         assert len(zone_blocks) == 3 and len(sample_blocks) == 3
-        assert len(output_blocks) == 6           # the six factory output blocks
+        # Like the reference instrument: no T8/T11/bplist trailer blocks.
+        assert lx._TYPE_OUTPUT not in by_type
 
-        # Instrument declares the right block counts (n_t8 at offset 32).
+        # Instrument declares the right block counts.
         ic = inst[0][3]
         n_zones, n_groups, n_samples, n_params = struct.unpack("<IIII", ic[4:20])
         assert (n_zones, n_groups, n_samples, n_params) == (3, 2, 3, 1)
-        assert struct.unpack("<I", ic[32:36])[0] == 6
+        assert struct.unpack("<I", ic[32:36])[0] == 0    # no T8 output blocks
         assert struct.unpack("<I", ic[40:44])[0] == 0    # no trailing bplist
+        assert struct.unpack("<I", ic[44:48])[0] == 0    # no T11 file bookmarks
 
         # Every group must be polyphonic (offset 3 bit0), max voices (offset 2 = 0),
         # and carry no round-robin chain / cycle flag — the anti-gating group shape.
@@ -161,23 +162,29 @@ def test_exs_roundtrip():
 
 
 def test_exs_round_robin():
-    # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. write_exs_kit_rr emits the
-    # CLASSIC EXS format that actually rotates: a key's full-velocity alternates
-    # are scattered ACROSS groups (the i-th sample of every key in group i, like
-    # Logic's Acoustic Kick C1 5), each zone carrying the round-robin opts marker
-    # (bit3). Classic blocks are shorter (108-byte zones, 40-byte instrument),
-    # plain type byte, and there are no output/bplist blocks.
+    # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1 (a "hat" we also choke).
+    # Round-robin per the user's Logic-authored reference instrument: every
+    # sample is a full-velocity zone in ITS OWN group; a key's groups form an
+    # @80 previous-group chain (head -1) and every group in the chain carries
+    # @84 = 2 ("select by: round robin"). Choke notes get exclusive class 1 +
+    # mono voices (+ @52 = 0), like the reference's gated hats.
     notes = {
         0: [_make_seg(0.2), _make_seg(0.05), _make_seg(0.4)],
         5: [_make_seg(0.3), _make_seg(0.1)],
         7: [_make_seg(0.15)],
     }
     labels = {0: "KICK", 5: "SNR", 7: "HH"}
+    zones = lx.instrument_to_zonespecs(
+        notes, key_label=lambda k: labels[k], round_robin=True)
+
+    # One zone AND one group per sample; all full-velocity RR zones.
+    assert len(zones) == 6
+    assert sorted(z.group_index for z in zones) == list(range(6))
+    assert all(z.rr and z.vel_low == 0 and z.vel_high == 127 for z in zones)
 
     with tempfile.TemporaryDirectory() as d:
-        exs_path = lx.write_exs_kit_rr(
-            "RR Kit", notes, key_label=lambda k: labels[k],
-            sample_rate=44100, dest_dir=Path(d))
+        exs_path = lx.write_exs_kit("RR Kit", zones, 44100, Path(d),
+                                    choke_notes={43})
         blocks = _parse_blocks(exs_path.read_bytes())
         by_type = {}
         for b in blocks:
@@ -187,43 +194,52 @@ def test_exs_round_robin():
         samples = by_type[lx._TYPE_SAMPLE]
         zone_blocks = by_type[lx._TYPE_ZONE]
 
-        # Classic layout: 108-byte zones; one group per RR POSITION (max depth 3);
-        # a sample/zone per sample (6); no output blocks.
-        assert len(zone_blocks[0][3]) == 108, "classic zones are 108 bytes"
-        assert len(groups) == 3 and len(samples) == 6 and len(zone_blocks) == 6
-        assert lx._TYPE_OUTPUT not in by_type, "classic format has no output blocks"
+        assert len(groups) == 6 and len(samples) == 6 and len(zone_blocks) == 6
         ic = by_type[lx._TYPE_INSTRUMENT][0][3]
-        assert len(ic) == 40, "classic instrument block is 40 bytes"
-        n_zones, n_groups, n_samples, n_params = struct.unpack("<IIII", ic[4:20])
-        assert (n_zones, n_groups, n_samples, n_params) == (6, 3, 6, 1)
+        n_zones, n_groups, n_samples, _ = struct.unpack("<IIII", ic[4:20])
+        assert (n_zones, n_groups, n_samples) == (6, 6, 6)
 
-        # A key's alternates: full velocity, distinct samples, the RR opts marker
-        # (bit3) on every zone, and spread ACROSS groups 0..n-1 (never stacked in
-        # one group). group i holds the i-th alternate of each deep-enough key.
-        by_note = {}
-        note_group = {}
+        # Zones: reference RR shape — opts 0x09, full velocity, single key,
+        # distinct samples, one group each.
+        by_note = {}          # note -> [group_index] in zone order
         for _t, _i, _n, c in zone_blocks:
-            assert c[6] == c[7] == c[1], "classic RR zone spans its single key"
+            assert c[0] == 0x09, "RR zones carry opts 0x09"
+            assert c[6] == c[7] == c[1], "drum zone spans one key"
             assert c[9] == 0 and c[10] == 127, "RR zones are full-velocity"
-            assert c[0] & 0x08, "RR zones must carry the bit3 round-robin marker"
-            note_group.setdefault(c[1], []).append(struct.unpack("<I", c[88:92])[0])
-            by_note.setdefault(c[1], []).append(struct.unpack("<I", c[92:96])[0])
-        # key 0->MIDI 36 (3), 5->41 (2), 7->43 (1)
+            by_note.setdefault(c[1], []).append(struct.unpack("<I", c[88:92])[0])
         assert sorted(by_note) == [36, 41, 43]
         assert sorted(len(v) for v in by_note.values()) == [1, 2, 3]
-        for note, sids in by_note.items():
-            assert len(set(sids)) == len(sids), f"note {note} reuses a sample"
-            gs = note_group[note]
-            assert sorted(gs) == list(range(len(gs))), f"note {note} not cross-group"
-        # group 0 has all three keys; group 2 only the 3-alternate key.
-        g_notes = {}
-        for _t, _i, _n, c in zone_blocks:
-            g_notes.setdefault(struct.unpack("<I", c[88:92])[0], set()).add(c[1])
-        assert g_notes[0] == {36, 41, 43} and g_notes[2] == {36}
+
+        # Groups: per-note @80 chains with @84 = 2 on every chained group;
+        # single-sample non-choke notes would be plain (none here besides the
+        # choked hat, which must be exclusive class 1 + mono + @52 = 0).
+        gmeta = {}            # ordinal -> content (groups are written in order)
+        for ordinal, (_t, _i, _n, gc) in enumerate(groups):
+            gmeta[ordinal] = gc
+        for note, gis in by_note.items():
+            gis = sorted(gis)
+            chain = [struct.unpack("<i", gmeta[g][80:84])[0] for g in gis]
+            if len(gis) > 1:
+                assert chain[0] == -1, f"note {note} chain head must be -1"
+                assert chain[1:] == gis[:-1], f"note {note} chain broken"
+                assert all(gmeta[g][84] == 2 for g in gis), \
+                    f"note {note} groups must be select-by-round-robin"
+            else:
+                assert chain == [-1] and gmeta[gis[0]][84] == 0
+        # The choked hat note 43: exclusive class 1, mono voices, @52 = 0.
+        hat_g = by_note[43][0]
+        hc = gmeta[hat_g]
+        assert hc[4] == 1 and hc[2] == 1 and hc[52] == 0, "hat must be choked"
+        # Everything else fully polyphonic, no exclusive class, @52 = 4.
+        for note in (36, 41):
+            for g in by_note[note]:
+                gc = gmeta[g]
+                assert gc[4] == 0 and gc[2] == 0 and gc[52] == 4
+                assert gc[3] & 1 and gc[90] == 0
 
         kit_dir = exs_path.parent
         for _t, _i, _n, c in samples:
-            fname = c[336:592].split(b"\x00", 1)[0].decode("ascii")
+            fname = c[336:600].split(b"\x00", 1)[0].decode("ascii")
             assert (kit_dir / fname).exists()
 
 

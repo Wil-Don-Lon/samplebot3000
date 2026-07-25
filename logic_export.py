@@ -5,10 +5,11 @@ that maps each sample to a MIDI key. Dropped into (or written directly to)
 `~/Music/Audio Music Apps/Sampler Instruments/`, the kit shows up in Logic's
 Sampler plugin instrument menu and plays natively.
 
-The EXS24 binary layout here mirrors, byte for byte, the known-good writer in
-git-moss/ConvertWithMoss (LGPLv3) — big-endian, block magic "SOBT", samples
-referenced by filename in the same folder. See `logic-pro-export-feature` memory
-for the field-by-field derivation.
+The EXS24 binary layout is the modern little-endian ("TBOS") format, cloned
+from Logic's own factory kits and from the user's Logic-authored reference
+instrument ("Round Robin / Gated Hat Reference") for the round-robin and
+hi-hat-choke group fields. See `logic-pro-export-feature` memory for the
+field-by-field derivation.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ class ZoneSpec:
     vel_high: int = 127          # 1..127
     one_shot: bool = True        # drums: ignore note-off, play whole sample
     group_index: int = 0         # which EXS group this zone belongs to
+    rr: bool = False             # round-robin alternate (opts 0x09, full vel)
 
 
 # ---------------------------------------------------------------------------
@@ -66,25 +68,18 @@ def instrument_to_zonespecs(
 ) -> list[ZoneSpec]:
     """Flatten `Instrument.notes` (key index -> [Segment]) into ZoneSpecs.
 
-    Two layouts for keys with several stacked samples:
+    Two layouts for keys with several stacked samples, both mirroring the
+    user's Logic-authored reference instrument ("Round Robin / Gated Hat
+    Reference", built and verified by ear in Logic's Sampler UI):
 
     - velocity split (default): a key's samples partition the velocity range —
-      soft hits low, loud hits high — so the hit velocity picks one. This is how
-      Logic's own factory drum kits give per-hit variation, and it exports
-      reliably. Matches the app's VEL LAYER mode.
-    - round robin (`round_robin=True`): every sample is a FULL-velocity zone and
-      the i-th sample of every key goes in group i, so a key's samples overlap
-      across groups. This mirrors how Logic's *consolidated* factory kits arrange
-      round-robin alternates. NOTE: Logic's separate-WAV ("modern"/electronic)
-      instrument format — the one this writer emits — is NOT known to actually
-      rotate these at play time (its factory kits use one sample per key), so
-      round-robin export may not audibly cycle in Logic. Prefer velocity split
-      for reliable variation. Kept because it still carries every sample.
-
-    Both layouts split the kit across several clean groups (factory kits always
-    use several — one kit-wide group left most keys silent in Logic; a group
-    chain stole voices → gating). Velocity split uses one group per KEY; round
-    robin uses one group per RR position.
+      soft hits low, loud hits high — so the hit velocity picks one. One group
+      per key. Matches the app's VEL LAYER mode.
+    - round robin (`round_robin=True`): every sample is a FULL-velocity zone in
+      ITS OWN group, and write_exs_kit chains a key's groups (@80 linked list)
+      with the group "select by" mode set to round robin (@84 = 2) — exactly
+      the encoding Logic's Sampler saves when you configure round robin in its
+      UI. Matches the app's RANDOM mode.
     """
     valid: dict[int, list] = {}
     for key in sorted(notes):
@@ -137,13 +132,13 @@ def instrument_to_zonespecs(
                 ))
         return zones
 
-    # Round-robin: every sample on a key is a FULL-velocity zone (so a key's
-    # samples overlap), and the i-th sample of every key goes in group i. That
-    # scatters a key's samples across DIFFERENT groups, which is the only way
-    # Logic rotates overlapping same-key zones (same-group overlap layers). Groups
-    # stay clean (no chain), so rotation is polyphonic — matches Deep Crunch etc.
+    # Round-robin, cloned from the reference: every sample is a FULL-velocity
+    # (0-127) zone in ITS OWN group ("RR Kick 1/2/3" style). A key's groups get
+    # consecutive indices so write_exs_kit can chain them (@80) and flag them
+    # select-by-round-robin (@84 = 2).
     zones = []
     used = set()
+    gi = 0
     for key, segs in valid.items():
         label = sanitize_name(key_label(key), f"Key{key}")
         n = len(segs)
@@ -152,9 +147,10 @@ def instrument_to_zonespecs(
             base = f"{label}" if n == 1 else f"{label}_{i + 1}"
             zones.append(ZoneSpec(
                 audio=aud(seg), name=_unique(base, used), midi_note=midi_note,
-                vel_low=1, vel_high=127, one_shot=one_shot,
-                group_index=i,       # RR position -> its own group (cross-group RR)
+                vel_low=0, vel_high=127, one_shot=one_shot,
+                group_index=gi, rr=True,
             ))
+            gi += 1
     return zones
 
 
@@ -171,18 +167,17 @@ def _unique(base: str, used: set[str]) -> str:
 # ---------------------------------------------------------------------------
 # EXS24 binary writer — modern little-endian ("TBOS") format
 #
-# Rewritten 2026-07-24 to match Logic's own factory kits byte-for-byte (see
-# exs_templates.py for how the templates were extracted). The previous writer
-# emitted the old big-endian "SOBT" layout with an all-zero PARAMS block. The
-# modern format carries a populated PARAMS block (16 voices) plus per-group
-# polyphonic options.
+# Templates come from Logic's own factory kits (see exs_templates.py); the
+# round-robin and choke field semantics come from the user's Logic-authored,
+# ear-verified reference instrument ("Round Robin / Gated Hat Reference"):
 #
-# Layout: one group per key (factory kits always use several groups; a single
-# kit-wide group leaves most keys silent in Logic). Round-robin is NOT a group
-# field — it rides on multiple full-velocity zones OVERLAPPING on one key, which
-# Logic's Sampler auto-cycles. An earlier writer chained per-sample groups via
-# offset-80/90; in the modern format those offsets create voice-stealing (gating
-# + only one sample sounding), so groups are now the factory template verbatim.
+# - Velocity split: one group per key; zones partition the velocity range.
+# - Round robin: one group PER SAMPLE; a key's groups are chained via the @80
+#   previous-group link (head -1) AND flagged @84 = 2 ("select by: round
+#   robin"). Both are required — the chain alone chokes (@84 missing was the
+#   bug in every earlier attempt), and @90 must stay 0.
+# - Hi-hat choke: @4 = exclusive class 1 + @2 = mono voices on the hat groups;
+#   every other group is fully polyphonic (@2 = 0) with full release.
 # ---------------------------------------------------------------------------
 
 import exs_templates as _T
@@ -227,17 +222,22 @@ def _instrument_content(n_zones: int, n_groups: int, n_samples: int) -> bytes:
     _put(b, 12, _le32(n_samples))
     _put(b, 16, _le32(1))            # one params block
     _put(b, 28, _le32(0))            # no per-zone T7 articulation blocks
-    _put(b, 32, _le32(len(_T.T8_NAMES)))
+    _put(b, 32, _le32(0))            # no T8 output blocks (reference has none)
     _put(b, 40, _le32(0))            # no trailing bplist state block
+    _put(b, 44, _le32(0))            # no T11 file-bookmark blocks (ref has 12)
     return bytes(b)
 
 
 def _zone_content(z: ZoneSpec, sample_index: int, group_index: int,
                   length: int) -> bytes:
     b = bytearray(_T.ZONE_TMPL)     # a known-good full-range one-shot zone
-    # opts bit0 = one-shot (ignore note-off, play the whole sample). The template
-    # has it set; honor z.one_shot so a non-one-shot caller isn't silently overridden.
-    b[0] = (b[0] | 0x01) if z.one_shot else (b[0] & ~0x01)
+    if z.rr:
+        # Clone the reference's round-robin zones exactly: opts 0x09.
+        b[0] = 0x09 if z.one_shot else 0x08
+    else:
+        # opts bit0 = one-shot (ignore note-off, play the whole sample). The
+        # template has it set; honor z.one_shot for non-one-shot callers.
+        b[0] = (b[0] | 0x01) if z.one_shot else (b[0] & ~0x01)
     root = int(np.clip(z.midi_note, 0, 127))
     b[1] = root                     # root key
     b[4] = 0                         # neutral fine-tune (template carries a per-sample offset)
@@ -252,15 +252,27 @@ def _zone_content(z: ZoneSpec, sample_index: int, group_index: int,
     return bytes(b)
 
 
-def _group_content() -> bytes:
-    """One key's group, verbatim from the factory template: polyphonic (offset 3
-    bit0 = 1), max voices (offset 2 = 0), no round-robin chain (offset 80 = -1)
-    and no cycle flag (offset 90 = 0). Logic's own kits set exactly this even for
-    keys with several round-robin samples — round-robin comes from the overlapping
-    zones, never from group fields. Chaining groups here (an earlier attempt) made
-    Logic steal one voice across the chain: gating, plus only one sample ever
-    sounding while the zone display still cycled."""
-    return bytes(_T.GROUP_TMPL)
+def _group_content(rr_prev: int = -1, select_rr: bool = False,
+                   exclusive: int = 0, mono: bool = False) -> bytes:
+    """One group, patched from the factory template. Field meanings come from
+    the user's Logic-authored, ear-verified reference instrument
+    ("Round Robin / Gated Hat Reference"):
+
+    - ROUND-ROBIN = the @80 previous-group chain (head -1, each later group →
+      the prior one) **plus @84 = 2** (the group's "select by" mode = round
+      robin). @84 was the missing ingredient in every earlier attempt. @90
+      stays 0 (an earlier "cycle flag = 1" guess was wrong and caused choking).
+    - CHOKE = @4 = exclusive class (hats share class 1) with @2 = 1 (mono
+      voices) — exactly how the reference gates its hats.
+    - Everything else: polyphonic (@3 bit0), max voices (@2 = 0), @91 = 1 —
+      straight from the template, matching the reference byte-for-byte."""
+    b = bytearray(_T.GROUP_TMPL)
+    b[2] = 1 if mono else 0
+    b[4] = exclusive & 0xFF
+    b[52] = 0 if mono else 4          # reference: 4 on RR/poly groups, 0 on mono
+    _put(b, 80, _le32(rr_prev if rr_prev >= 0 else 0xFFFFFFFF))
+    b[84] = 2 if select_rr else 0
+    return bytes(b)
 
 
 def _sample_content(length: int, sample_rate: int, bit_depth: int,
@@ -309,6 +321,7 @@ def write_exs_kit(
     zones: list[ZoneSpec],
     sample_rate: int,
     dest_dir: Path,
+    choke_notes: Optional[set] = None,
     progress: Optional[Callable[[str, float], None]] = None,
 ) -> Path:
     """Write `<dest_dir>/<KitName>.exs` plus its WAVs, flat into `dest_dir`.
@@ -316,6 +329,11 @@ def write_exs_kit(
     No redundant per-kit subfolder: the .exs sits directly in `dest_dir` (the GUI
     points this at a single "Samplebot-3000" folder), and WAVs are named
     `<KitName> - <zone>.wav` so several kits can share the folder without clashing.
+
+    `choke_notes`: MIDI notes whose groups join exclusive class 1 with mono
+    voices — the hi-hat choke from the reference instrument (closed/pedal hats
+    cut the open hat's ring; nothing else is ever gated).
+
     Returns the path to the written .exs. Raises ValueError if there are no zones.
     """
     if not zones:
@@ -364,15 +382,32 @@ def write_exs_kit(
     if progress:
         progress("building instrument", 0.8)
 
-    # 3) Groups come straight from the zone group_index (per key for velocity
-    #    split, per RR position for round-robin — see instrument_to_zonespecs).
-    #    Every group is the factory template verbatim; round-robin rides on how
-    #    zones are spread across groups, not on group fields. Name each group
+    # 3) Groups come straight from the zone group_index (one per key for
+    #    velocity split, one per SAMPLE for round-robin). Per the reference
+    #    instrument: a key that owns several round-robin groups gets them
+    #    chained via @80 (head -1, each later group → the prior one) and every
+    #    group in the chain flagged select-by-round-robin (@84 = 2). Groups on
+    #    choke notes join exclusive class 1 with mono voices. Name each group
     #    after its first zone so Logic's group list is readable.
     n_groups = max((z.group_index for z in zones), default=0) + 1
     group_names: dict[int, str] = {}
+    group_note: dict[int, int] = {}
     for z in zones:
         group_names.setdefault(z.group_index, z.name)
+        group_note.setdefault(z.group_index, z.midi_note)
+    note_groups: dict[int, list[int]] = {}
+    for gi, note in group_note.items():
+        note_groups.setdefault(note, []).append(gi)
+    rr_prev = {gi: -1 for gi in range(n_groups)}
+    select_rr = {gi: False for gi in range(n_groups)}
+    for note, gis in note_groups.items():
+        gis = sorted(gis)
+        if len(gis) > 1:                      # round-robin chain for this key
+            for j, gi in enumerate(gis):
+                select_rr[gi] = True
+                if j:
+                    rr_prev[gi] = gis[j - 1]
+    choke = choke_notes or set()
 
     # 4) Assemble the EXS blocks in file order: instrument, zones, groups,
     #    samples, params, then the six cosmetic output blocks.
@@ -385,16 +420,20 @@ def write_exs_kit(
                       _zone_content(z, sample_index=sample_of_zone[i],
                                     group_index=z.group_index, length=length))
     for gi in range(n_groups):
+        choked = group_note.get(gi) in choke
         out += _block(_TYPE_GROUP, gi, group_names.get(gi, safe_kit),
-                      _group_content())
+                      _group_content(rr_prev=rr_prev[gi],
+                                     select_rr=select_rr[gi],
+                                     exclusive=1 if choked else 0,
+                                     mono=choked))
     for si, z in enumerate(unique_zones):
         length, file_size, data_start, file_name = sample_meta[si]
         out += _block(_TYPE_SAMPLE, si, z.name,
                       _sample_content(length, int(sample_rate), bit_depth,
                                       file_size, data_start, dir_path, file_name))
     out += _block(_TYPE_PARAMS, 0, "Default Param", bytes(_T.PARAMS_TMPL))
-    for oi, oname in enumerate(_T.T8_NAMES):
-        out += _block(_TYPE_OUTPUT, oi, oname, _T.T8_CONTENT)
+    # No T8/T11/bplist trailer blocks — the reference instrument has none of
+    # ours (its T11 file-bookmarks are per-machine and regenerated by Logic).
 
     exs_path = kit_dir / f"{safe_kit}.exs"
     exs_path.write_bytes(bytes(out))
@@ -402,191 +441,3 @@ def write_exs_kit(
         progress("done", 1.0)
     return exs_path
 
-
-# ---------------------------------------------------------------------------
-# Round-robin writer — the classic ("108-byte zone") EXS format
-#
-# The modern format above never rotates multiple samples on one key (its factory
-# kits are one-sample-per-key). Logic's *classic* EXS format does: several
-# full-velocity zones sharing a group round-robin. It's an older, simpler layout
-# (40-byte instrument, 108-byte zones, 120-byte groups, 592-byte samples, a
-# 304-byte params block, NO output/bplist blocks) and its block header uses a
-# plain type byte (no 0x40). Templated verbatim from Logic's "Electronic Snare
-# D1 6" (a 2-way full-velocity round-robin), patching per-instance fields.
-# ---------------------------------------------------------------------------
-
-def _block_rr(block_type: int, index: int, name: str, content: bytes) -> bytes:
-    """Classic-format block header: like _block but the type byte is plain (the
-    modern format ORs it with 0x40; the classic format does not)."""
-    head = bytes((1, 1, 0, block_type & 0x3F))
-    head += _le32(len(content)) + _le32(index) + _le32(0) + _MAGIC
-    head += _ascii(name, 64)
-    return head + content
-
-
-def _zone_rr_content(midi_note: int, group_index: int, sample_index: int,
-                     length: int, alt_index: int) -> bytes:
-    b = bytearray(_T.ZONE_RR_TMPL)
-    # opts 0x09 = one-shot (bit0) + the round-robin marker (bit3). Every factory
-    # round-robin kit sets bit3 on its alternates (Acoustic Kick 0x09, the snare
-    # 0x08, Detroit 0x0b); it's the bit that makes Logic treat overlapping same-
-    # key zones as a rotating pool rather than a static stack.
-    b[0] = 0x09
-    root = int(np.clip(midi_note, 0, 127))
-    b[1] = root                                  # root key
-    b[6] = root                                  # key low  (single key)
-    b[7] = root                                  # key high
-    b[9] = 0                                      # full velocity range
-    b[10] = 127
-    _put(b, 16, _le32(max(0, length)))           # sample end (frames)
-    _put(b, 24, _le32(max(0, length)))
-    _put(b, 88, _le32(group_index))
-    _put(b, 92, _le32(sample_index))
-    return bytes(b)
-
-
-def _sample_rr_content(length: int, sample_rate: int, bit_depth: int,
-                       file_size: int, data_start: int, dir_path: str,
-                       file_name: str) -> bytes:
-    b = bytearray(_T.SAMPLE_RR_TMPL)
-    _put(b, 0, _le32(data_start))
-    _put(b, 4, _le32(length))
-    _put(b, 8, _le32(sample_rate))
-    _put(b, 12, _le32(bit_depth))
-    _put(b, 16, _le32(1))                        # channels (mono)
-    _put(b, 20, _le32(1))
-    _put(b, 24, _le32(1))
-    _put(b, 28, b"EVAW")                         # "WAVE" 4cc, byte-reversed
-    _put(b, 32, _le32(file_size))
-    _put(b, 80, _ascii(dir_path, 256))
-    _put(b, 336, _ascii(file_name, len(_T.SAMPLE_RR_TMPL) - 336))
-    return bytes(b)
-
-
-def write_exs_kit_rr(
-    kit_name: str,
-    notes: dict[int, list],
-    key_label: Callable[[int], str],
-    sample_rate: int,
-    dest_dir: Path,
-    base_note: int = BASE_MIDI_NOTE,
-    process_audio: Optional[Callable[[object, np.ndarray], np.ndarray]] = None,
-    progress: Optional[Callable[[str, float], None]] = None,
-) -> Path:
-    """Write a round-robin kit in the classic EXS format.
-
-    A key's samples become full-velocity zones scattered ACROSS groups — the
-    i-th sample of every key goes in group i — and each zone's opts carries the
-    round-robin marker (bit3). That's exactly how Logic's own separate-file
-    round-robin kits are built (e.g. Acoustic Kick C1 5: a 3-way key with its
-    alternates in groups 0/1/2). Factory kits only ever put 2 alternates in one
-    group; 3+ are always cross-group, so cross-group is used throughout.
-
-    `process_audio(seg, raw)` bakes the app's per-sample effects into the WAVs
-    (same as the modern writer). Returns the written .exs path.
-    """
-    # Collect, per key, its samples soft->loud (the round-robin order).
-    valid: dict[int, list] = {}
-    for key in sorted(notes):
-        segs = [s for s in notes[key] if getattr(s, "audio", None) is not None
-                and np.asarray(s.audio).size > 0]
-        if segs:
-            valid[key] = sorted(segs, key=lambda s: getattr(s, "rms", 0.0))
-    if not valid:
-        raise ValueError("nothing to export — the kit has no samples")
-
-    _processed: dict[int, np.ndarray] = {}
-    def aud(seg) -> np.ndarray:
-        raw = np.asarray(seg.audio, dtype=np.float32).ravel()
-        if process_audio is None:
-            return raw
-        k = id(seg.audio)
-        if k not in _processed:
-            _processed[k] = np.asarray(process_audio(seg, raw),
-                                       dtype=np.float32).ravel()
-        return _processed[k]
-
-    safe_kit = sanitize_name(kit_name)
-    kit_dir = Path(dest_dir).resolve()
-    kit_dir.mkdir(parents=True, exist_ok=True)
-    dir_path = str(kit_dir)
-    bit_depth, subtype = 24, "PCM_24"
-
-    # Cross-group round-robin: the i-th sample of every key goes in group i, so a
-    # key's alternates land in DIFFERENT groups (which is what makes Logic rotate
-    # them). Group count = the deepest key's sample count. Within a group each key
-    # contributes at most one zone (distinct notes → no accidental stacking).
-    zone_infos: list[tuple] = []   # (audio, midi_note, group_index, alt_index)
-    used: set[str] = set()
-    zone_names: list[str] = []
-    max_depth = max(len(segs) for segs in valid.values())
-    for key, segs in valid.items():
-        label = sanitize_name(key_label(key), f"Key{key}")
-        midi_note = int(np.clip(base_note + key, 0, 127))
-        n = len(segs)
-        for i, seg in enumerate(segs):
-            base = label if n == 1 else f"{label}_{i + 1}"
-            zone_names.append(_unique(base, used))
-            zone_infos.append((aud(seg), midi_note, i, i))   # group_index = RR position i
-    group_names = [f"RR {i + 1}" for i in range(max_depth)]
-
-    # Dedup WAVs by audio identity, write them, gather per-sample metadata.
-    sample_of_zone: list[int] = []
-    unique_audio: list[np.ndarray] = []
-    unique_name: list[str] = []
-    by_id: dict[int, int] = {}
-    for (audio, _mn, _g, _a), zname in zip(zone_infos, zone_names):
-        aid = id(audio)
-        si = by_id.get(aid)
-        if si is None:
-            si = len(unique_audio)
-            by_id[aid] = si
-            unique_audio.append(audio)
-            unique_name.append(zname)
-        sample_of_zone.append(si)
-
-    sample_meta = []
-    total = len(unique_audio)
-    for si, audio in enumerate(unique_audio):
-        if progress:
-            progress(f"writing {unique_name[si]}.wav", si / max(1, total) * 0.7)
-        wav_path = kit_dir / f"{safe_kit} - {unique_name[si]}.wav"
-        a = np.clip(np.asarray(audio, dtype=np.float32).ravel(), -1.0, 1.0)
-        sf.write(str(wav_path), a, int(sample_rate), subtype=subtype)
-        sample_meta.append((int(a.shape[0]), int(wav_path.stat().st_size),
-                            _wav_data_offset(wav_path), wav_path.name))
-
-    if progress:
-        progress("building instrument", 0.8)
-
-    n_zones = len(zone_infos)
-    n_groups = len(group_names)
-    n_samples = len(unique_audio)
-
-    out = bytearray()
-    instr = bytearray(_T.INSTR_RR_TMPL)
-    _put(instr, 4, _le32(n_zones))
-    _put(instr, 8, _le32(n_groups))
-    _put(instr, 12, _le32(n_samples))
-    _put(instr, 16, _le32(1))
-    out += _block_rr(_TYPE_INSTRUMENT, 0, safe_kit, bytes(instr))
-    for i, (audio, midi_note, gidx, alt) in enumerate(zone_infos):
-        length = sample_meta[sample_of_zone[i]][0]
-        out += _block_rr(_TYPE_ZONE, i, zone_names[i],
-                         _zone_rr_content(midi_note, gidx, sample_of_zone[i],
-                                          length, alt))
-    for gi, gname in enumerate(group_names):
-        out += _block_rr(_TYPE_GROUP, gi, gname, bytes(_T.GROUP_RR_TMPL))
-    for si in range(n_samples):
-        length, file_size, data_start, file_name = sample_meta[si]
-        out += _block_rr(_TYPE_SAMPLE, si, unique_name[si],
-                         _sample_rr_content(length, int(sample_rate), bit_depth,
-                                            file_size, data_start, dir_path,
-                                            file_name))
-    out += _block_rr(_TYPE_PARAMS, 0, "Default Param", bytes(_T.PARAMS_RR_TMPL))
-
-    exs_path = kit_dir / f"{safe_kit}.exs"
-    exs_path.write_bytes(bytes(out))
-    if progress:
-        progress("done", 1.0)
-    return exs_path
