@@ -162,10 +162,11 @@ def test_exs_roundtrip():
 
 def test_exs_round_robin():
     # key 0 -> 3 samples, key 5 -> 2, key 7 -> 1. write_exs_kit_rr emits the
-    # CLASSIC EXS format (the one that actually rotates): each key's samples become
-    # full-velocity zones sharing that key's own group; Logic cycles them. Classic
-    # blocks are shorter (108-byte zones, 40-byte instrument) with a plain type
-    # byte, and there are no output/bplist blocks.
+    # CLASSIC EXS format that actually rotates: a key's full-velocity alternates
+    # are scattered ACROSS groups (the i-th sample of every key in group i, like
+    # Logic's Acoustic Kick C1 5), each zone carrying the round-robin opts marker
+    # (bit3). Classic blocks are shorter (108-byte zones, 40-byte instrument),
+    # plain type byte, and there are no output/bplist blocks.
     notes = {
         0: [_make_seg(0.2), _make_seg(0.05), _make_seg(0.4)],
         5: [_make_seg(0.3), _make_seg(0.1)],
@@ -186,8 +187,8 @@ def test_exs_round_robin():
         samples = by_type[lx._TYPE_SAMPLE]
         zone_blocks = by_type[lx._TYPE_ZONE]
 
-        # Classic layout: 108-byte zones; one group PER KEY (3); a sample/zone
-        # per sample (6); no output blocks.
+        # Classic layout: 108-byte zones; one group per RR POSITION (max depth 3);
+        # a sample/zone per sample (6); no output blocks.
         assert len(zone_blocks[0][3]) == 108, "classic zones are 108 bytes"
         assert len(groups) == 3 and len(samples) == 6 and len(zone_blocks) == 6
         assert lx._TYPE_OUTPUT not in by_type, "classic format has no output blocks"
@@ -196,27 +197,29 @@ def test_exs_round_robin():
         n_zones, n_groups, n_samples, n_params = struct.unpack("<IIII", ic[4:20])
         assert (n_zones, n_groups, n_samples, n_params) == (6, 3, 6, 1)
 
-        # A key's alternates share ONE group, at FULL velocity, with distinct
-        # samples; the opts byte is 0 on the first alternate and 8 on the rest
-        # (the factory round-robin marker). Different keys use different groups.
+        # A key's alternates: full velocity, distinct samples, the RR opts marker
+        # (bit3) on every zone, and spread ACROSS groups 0..n-1 (never stacked in
+        # one group). group i holds the i-th alternate of each deep-enough key.
         by_note = {}
         note_group = {}
-        note_opts = {}
         for _t, _i, _n, c in zone_blocks:
             assert c[6] == c[7] == c[1], "classic RR zone spans its single key"
             assert c[9] == 0 and c[10] == 127, "RR zones are full-velocity"
-            note_group.setdefault(c[1], set()).add(struct.unpack("<I", c[88:92])[0])
+            assert c[0] & 0x08, "RR zones must carry the bit3 round-robin marker"
+            note_group.setdefault(c[1], []).append(struct.unpack("<I", c[88:92])[0])
             by_note.setdefault(c[1], []).append(struct.unpack("<I", c[92:96])[0])
-            note_opts.setdefault(c[1], []).append(c[0])
         # key 0->MIDI 36 (3), 5->41 (2), 7->43 (1)
         assert sorted(by_note) == [36, 41, 43]
         assert sorted(len(v) for v in by_note.values()) == [1, 2, 3]
-        assert all(len(g) == 1 for g in note_group.values()), "a key = one group"
-        assert len({next(iter(g)) for g in note_group.values()}) == 3
         for note, sids in by_note.items():
             assert len(set(sids)) == len(sids), f"note {note} reuses a sample"
-            assert note_opts[note][0] == 0x00
-            assert all(o == 0x08 for o in note_opts[note][1:])
+            gs = note_group[note]
+            assert sorted(gs) == list(range(len(gs))), f"note {note} not cross-group"
+        # group 0 has all three keys; group 2 only the 3-alternate key.
+        g_notes = {}
+        for _t, _i, _n, c in zone_blocks:
+            g_notes.setdefault(struct.unpack("<I", c[88:92])[0], set()).add(c[1])
+        assert g_notes[0] == {36, 41, 43} and g_notes[2] == {36}
 
         kit_dir = exs_path.parent
         for _t, _i, _n, c in samples:

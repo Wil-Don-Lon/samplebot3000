@@ -427,9 +427,11 @@ def _block_rr(block_type: int, index: int, name: str, content: bytes) -> bytes:
 def _zone_rr_content(midi_note: int, group_index: int, sample_index: int,
                      length: int, alt_index: int) -> bytes:
     b = bytearray(_T.ZONE_RR_TMPL)
-    # opts: the factory round-robin alternates carry 0x00 on the first zone of a
-    # key and 0x08 on the rest — replicate that so Logic treats them as a cycle.
-    b[0] = 0x00 if alt_index == 0 else 0x08
+    # opts 0x09 = one-shot (bit0) + the round-robin marker (bit3). Every factory
+    # round-robin kit sets bit3 on its alternates (Acoustic Kick 0x09, the snare
+    # 0x08, Detroit 0x0b); it's the bit that makes Logic treat overlapping same-
+    # key zones as a rotating pool rather than a static stack.
+    b[0] = 0x09
     root = int(np.clip(midi_note, 0, 127))
     b[1] = root                                  # root key
     b[6] = root                                  # key low  (single key)
@@ -471,8 +473,14 @@ def write_exs_kit_rr(
     process_audio: Optional[Callable[[object, np.ndarray], np.ndarray]] = None,
     progress: Optional[Callable[[str, float], None]] = None,
 ) -> Path:
-    """Write a round-robin kit in the classic EXS format: each key's samples
-    become full-velocity zones in that key's own group, so Logic cycles them.
+    """Write a round-robin kit in the classic EXS format.
+
+    A key's samples become full-velocity zones scattered ACROSS groups — the
+    i-th sample of every key goes in group i — and each zone's opts carries the
+    round-robin marker (bit3). That's exactly how Logic's own separate-file
+    round-robin kits are built (e.g. Acoustic Kick C1 5: a 3-way key with its
+    alternates in groups 0/1/2). Factory kits only ever put 2 alternates in one
+    group; 3+ are always cross-group, so cross-group is used throughout.
 
     `process_audio(seg, raw)` bakes the app's per-sample effects into the WAVs
     (same as the modern writer). Returns the written .exs path.
@@ -504,21 +512,23 @@ def write_exs_kit_rr(
     dir_path = str(kit_dir)
     bit_depth, subtype = 24, "PCM_24"
 
-    # One group per key; each group holds that key's full-velocity alternates.
-    # (zone info, group index, alt index within the group) plus per-key group name.
+    # Cross-group round-robin: the i-th sample of every key goes in group i, so a
+    # key's alternates land in DIFFERENT groups (which is what makes Logic rotate
+    # them). Group count = the deepest key's sample count. Within a group each key
+    # contributes at most one zone (distinct notes → no accidental stacking).
     zone_infos: list[tuple] = []   # (audio, midi_note, group_index, alt_index)
-    group_names: list[str] = []
     used: set[str] = set()
     zone_names: list[str] = []
-    for gidx, (key, segs) in enumerate(valid.items()):
+    max_depth = max(len(segs) for segs in valid.values())
+    for key, segs in valid.items():
         label = sanitize_name(key_label(key), f"Key{key}")
-        group_names.append(label)
         midi_note = int(np.clip(base_note + key, 0, 127))
         n = len(segs)
         for i, seg in enumerate(segs):
             base = label if n == 1 else f"{label}_{i + 1}"
             zone_names.append(_unique(base, used))
-            zone_infos.append((aud(seg), midi_note, gidx, i))
+            zone_infos.append((aud(seg), midi_note, i, i))   # group_index = RR position i
+    group_names = [f"RR {i + 1}" for i in range(max_depth)]
 
     # Dedup WAVs by audio identity, write them, gather per-sample metadata.
     sample_of_zone: list[int] = []
