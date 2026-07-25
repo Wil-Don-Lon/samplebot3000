@@ -1912,6 +1912,8 @@ class MainWindow(QMainWindow):
         hl = "color:#ff8a1e; font-weight:bold;" if on else ""
         self.sens_label.setStyleSheet(hl)
         self.trim_label.setStyleSheet(hl)
+        self.sens_slider.setGlow(on)      # blue halo on the two knobs while armed
+        self.trim_slider.setGlow(on)
         self.autotrim_hint.setText(
             "Tune TRANSIENT SENS + TRIM THRESHOLD (cyan lines preview this "
             "sample), then APPLY TO CLUSTER; select another key for the next."

@@ -45,8 +45,17 @@ class Knob(QWidget):
         self._diameter = diameter
         self._drag_y: Optional[float] = None
         self._drag_v0 = 0
-        self.setFixedSize(diameter + 6, diameter + 6)
+        self._glow = False
+        # Extra margin (7px vs 3px) leaves room for the blue "armed" glow ring.
+        self.setFixedSize(diameter + 14, diameter + 14)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def setGlow(self, on: bool) -> None:
+        """Toggle a blue halo (e.g. while AUTOTRIM is armed on this knob)."""
+        on = bool(on)
+        if on != self._glow:
+            self._glow = on
+            self.update()
 
     # QSlider-compatible API ------------------------------------------------
     def setRange(self, lo: int, hi: int) -> None:
@@ -91,9 +100,16 @@ class Knob(QWidget):
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        rect = QRectF(3, 3, self._diameter, self._diameter)
+        rect = QRectF(7, 7, self._diameter, self._diameter)
         cx, cy = rect.center().x(), rect.center().y()
         rad = self._diameter / 2.0
+
+        # Blue "armed" glow: concentric translucent rings around the body.
+        if self._glow:
+            p.setBrush(Qt.NoBrush)
+            for grow, alpha in ((6, 30), (4, 70), (2, 130)):
+                p.setPen(QPen(QColor(95, 208, 255, alpha), 2.4))
+                p.drawEllipse(rect.adjusted(-grow, -grow, grow, grow))
 
         frac = 0.0
         if self._max > self._min:
