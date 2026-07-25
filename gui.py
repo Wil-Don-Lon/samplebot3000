@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFileDialog, QSlider, QProgressBar,
     QFrame, QSizePolicy, QButtonGroup, QScrollArea,
-    QApplication, QLineEdit, QDialog, QListWidget, QListWidgetItem, QMessageBox,
+    QApplication, QLineEdit, QDialog, QListWidget, QListWidgetItem,
 )
 
 import pipeline as P
@@ -848,18 +848,19 @@ class MainWindow(QMainWindow):
         editor_head.addWidget(self._section_header("SAMPLE EDITOR"))
         editor_head.addStretch(1)
         # AUTOTRIM: arm it, then dial TRANSIENT SENS / TRIM THRESHOLD (they light
-        # up and the editor previews the result on the current sample); APPLY TO
-        # ALL commits the retrim to every sample.
+        # up and the editor previews the cut on the current sample); APPLY commits
+        # that trim to every sample on the SELECTED KEY's cluster, so each cluster
+        # can be judged on its own before moving to the next.
         self.autotrim_btn = QPushButton("AUTOTRIM")
         self.autotrim_btn.setObjectName("octaveBtn")
         self.autotrim_btn.setCheckable(True)
         self.autotrim_btn.setEnabled(False)
         self.autotrim_btn.toggled.connect(self._on_autotrim_toggled)
         editor_head.addWidget(self.autotrim_btn)
-        self.autotrim_apply_btn = QPushButton("APPLY TO ALL")
+        self.autotrim_apply_btn = QPushButton("APPLY TO CLUSTER")
         self.autotrim_apply_btn.setObjectName("octaveBtn")
         self.autotrim_apply_btn.setVisible(False)
-        self.autotrim_apply_btn.clicked.connect(self._apply_autotrim_all)
+        self.autotrim_apply_btn.clicked.connect(self._apply_autotrim_cluster)
         editor_head.addWidget(self.autotrim_apply_btn)
         col.addLayout(editor_head)
 
@@ -1906,14 +1907,15 @@ class MainWindow(QMainWindow):
 
     def _on_autotrim_toggled(self, on: bool) -> None:
         """Arm/disarm autotrim: light the two knobs, live-preview on the current
-        sample as they're tuned, and reveal APPLY TO ALL."""
+        sample as they're tuned, and reveal APPLY TO CLUSTER."""
         self.autotrim_apply_btn.setVisible(on)
         hl = "color:#ff8a1e; font-weight:bold;" if on else ""
         self.sens_label.setStyleSheet(hl)
         self.trim_label.setStyleSheet(hl)
         self.autotrim_hint.setText(
-            "Tune TRANSIENT SENS + TRIM THRESHOLD (cyan lines preview the cut on "
-            "this sample), then APPLY TO ALL." if on else "")
+            "Tune TRANSIENT SENS + TRIM THRESHOLD (cyan lines preview this "
+            "sample), then APPLY TO CLUSTER; select another key for the next."
+            if on else "")
         if on:
             self.sens_slider.valueChanged.connect(self._autotrim_preview)
             self.trim_slider.valueChanged.connect(self._autotrim_preview)
@@ -1936,29 +1938,24 @@ class MainWindow(QMainWindow):
         start, end = P.autotrim_bounds(seg.source, *self._autotrim_params())
         self.wave_editor.set_preview(start, end)
 
-    def _apply_autotrim_all(self) -> None:
-        """Retrim every sample (start→transient, end→next transient) with the
-        current knobs, after a confirm."""
-        all_segs = [s for segs in self._instrument.notes.values() for s in segs]
-        all_segs += list(self._instrument.unassigned)
-        if not all_segs:
+    def _apply_autotrim_cluster(self) -> None:
+        """Retrim every sample on the SELECTED KEY's cluster (start→transient,
+        end→next transient) with the current knobs, then audition the active one.
+        Stays armed so you can select another key and judge each cluster on its
+        own — nuance over a blunt whole-kit batch."""
+        key = self._selected_key
+        segs = self._instrument.notes.get(key) if key is not None else None
+        if not segs:
             return
         sens, trim = self._autotrim_params()
-        resp = QMessageBox.question(
-            self, "Autotrim all samples",
-            f"Retrim all {len(all_segs)} samples — start snug to the transient, "
-            f"end out to the next transient — using the current TRANSIENT SENS "
-            f"and TRIM THRESHOLD?\n\nYou can still hand-tune any sample afterward.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if resp != QMessageBox.Yes:
-            return
-        for seg in all_segs:
+        for seg in segs:
             P.ensure_source(seg)
             P.reslice_segment(seg, *P.autotrim_bounds(seg.source, sens, trim))
-        self.autotrim_btn.setChecked(False)     # disarm (clears preview/highlights)
+        # Reload so the handles snap to the committed bounds.
         self._show_active_in_editor()
         self._update_sample_selector()
-        self.status.setText(f"autotrimmed {len(all_segs)} samples")
+        idx = self._sample_choice.get(key, 0)
+        self._play_selected_sample(key, force_idx=idx)
 
     @Slot(int)
     def _on_note_released(self, note_index: int) -> None:
