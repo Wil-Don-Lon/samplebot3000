@@ -390,9 +390,6 @@ class PipelineWorker(QObject):
     def __init__(
         self,
         audio_path: str,
-        mode: str,
-        n_clusters: int,
-        threshold: float,
         min_cluster_size: float,
         sensitivity: float,
         segment_length_s: float,
@@ -403,9 +400,6 @@ class PipelineWorker(QObject):
     ) -> None:
         super().__init__()
         self._audio_path = audio_path
-        self._mode = mode
-        self._n_clusters = n_clusters
-        self._threshold = threshold
         self._min_cluster_size = min_cluster_size
         self._sensitivity = sensitivity
         self._segment_length_s = segment_length_s
@@ -419,9 +413,6 @@ class PipelineWorker(QObject):
         try:
             inst = run_pipeline(
                 self._audio_path,
-                mode=self._mode,
-                n_clusters=self._n_clusters,
-                threshold=self._threshold,
                 min_cluster_size=self._min_cluster_size,
                 sensitivity=self._sensitivity,
                 segment_length_s=self._segment_length_s,
@@ -1261,7 +1252,6 @@ class MainWindow(QMainWindow):
 
         # Cluster-first flow only. Stage 1 = HDBSCAN clustering; Stage 2 = the
         # AUTO sorter drops finished clusters onto GM keys (FREQUENCY skips it).
-        mode = "hdbscan"   # the only clustering model
         clap_sort = self._sort_mode == "auto"
         self._result_is_classify = clap_sort   # AUTO → fixed GM layout + cap labels
 
@@ -1274,9 +1264,6 @@ class MainWindow(QMainWindow):
         self._thread = QThread(self)
         self._worker = PipelineWorker(
             self._audio_path,
-            mode=mode,
-            n_clusters=8,        # unused by HDBSCAN; only its KMeans fallback
-            threshold=5.0,       # unused by HDBSCAN
             min_cluster_size=min_cluster_size,
             sensitivity=self.sens_slider.value() / 100.0,
             segment_length_s=self.length_slider.value() / 10.0,

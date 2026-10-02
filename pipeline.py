@@ -1,11 +1,15 @@
 """Audio analysis pipeline: file path -> Instrument.
 
-Three clustering modes:
-- "manual"  : KMeans with a user-specified k
-- "auto"    : AgglomerativeClustering with a distance threshold
-- "hdbscan" : HDBSCAN with min_cluster_size; noise points form one outlier
-              cluster routed to Instrument.unassigned (no key, not exported)
-              to their nearest cluster's centroid so nothing is dropped.
+Two stages, in order:
+- STAGE 1  HDBSCAN over the 57-dim features groups the slices. Noise points form
+           one outlier cluster routed to Instrument.unassigned (no key, not
+           exported) for the user to triage in the recategorize dialog.
+- STAGE 2  optional (`clap_sort`): CLAP labels each FINISHED cluster by zero-shot
+           prompt match, and the kit lands on the fixed GM drum layout, one
+           cluster per key. Skipped, clusters are simply ordered by pitch.
+
+CLAP never touches stage 1 — clustering groups this kit's own sounds on its own,
+and the embedding is used only to NAME the groups afterward.
 
 Feature vector (57 dims): captures timbre (MFCC mean/std), timbral evolution
 (MFCC delta), pitch content (chroma), spectral shape (centroid mean/std,
@@ -26,7 +30,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import librosa
-from sklearn.cluster import KMeans, AgglomerativeClustering, HDBSCAN
+from sklearn.cluster import KMeans, HDBSCAN
 
 
 # -------- constants --------
@@ -757,36 +761,6 @@ def _dedup_similar_segments(
     return [s for i, s in enumerate(segments) if keep[i]]
 
 
-def cluster_segments(segments: list[Segment], n_clusters: int,
-                     feature_matrix: Optional[np.ndarray] = None) -> list[Segment]:
-    if not segments:
-        return segments
-    n_clusters = max(1, min(n_clusters, len(segments)))
-    Xn = _normalize_features(segments, feature_matrix)
-    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = km.fit_predict(Xn)
-    for seg, lab in zip(segments, labels):
-        seg.cluster = int(lab)
-    return segments
-
-
-def cluster_segments_auto(segments: list[Segment], threshold: float,
-                          feature_matrix: Optional[np.ndarray] = None) -> list[Segment]:
-    if not segments:
-        return segments
-    if len(segments) == 1:
-        segments[0].cluster = 0
-        return segments
-    Xn = _normalize_features(segments, feature_matrix)
-    ac = AgglomerativeClustering(
-        n_clusters=None, distance_threshold=float(threshold), linkage="ward"
-    )
-    labels = ac.fit_predict(Xn)
-    for seg, lab in zip(segments, labels):
-        seg.cluster = int(lab)
-    return segments
-
-
 def cluster_segments_hdbscan(segments: list[Segment], min_cluster_size: int,
                              feature_matrix: Optional[np.ndarray] = None) -> list[Segment]:
     """Density-based clustering.
@@ -907,71 +881,6 @@ LEAF_TO_GM_FAMILY: dict[str, str] = {
     "side_stick": "side_stick", "cowbell": "cowbell", "tambourine": "tambourine",
     "fx": "fx",
 }
-
-
-def classify_feature_matrix(segments: list[Segment], feature_type: str) -> np.ndarray:
-    """Feature matrix for a classifier, matching how its model was trained.
-
-    "hand"       : the 57-dim hand-crafted vector already on each segment.
-    "fused_clap" : CLAP audio embedding ++ pitch/temporal scalars (brief §2+§3),
-                   computed on the fixed-window `classify_audio` slice so it
-                   stays train/serve-consistent (§1). The heavy embedder is
-                   imported lazily, so clustering users never pay for torch.
-    """
-    if feature_type == "fused_clap":
-        from embedders import get_embedder
-        emb = get_embedder("clap")
-        audios = [s.classify_audio if s.classify_audio is not None else s.audio
-                  for s in segments]
-        E = emb.embed_batch(audios, TARGET_SR)
-        P = np.stack([pitch_temporal_features(a) for a in audios])
-        return np.hstack([E, P]).astype(np.float64)
-    return np.stack([s.features for s in segments]).astype(np.float64)
-
-
-def _classify_ensemble(segments: list[Segment], members: list) -> None:
-    """Majority-vote consensus across several models (brief-style ensemble).
-
-    `members` is a list of (fitted_pipeline, feature_type). Each model votes its
-    predicted label per segment; the most-voted label wins. Ties break toward the
-    earlier member (callers order the strongest model first). Feature matrices are
-    computed once per distinct feature_type and reused, so the CLAP embedding pass
-    runs at most once.
-    """
-    from collections import Counter
-    ballots: list[list[str]] = [[] for _ in segments]
-    feat_cache: dict[str, np.ndarray] = {}
-    for pipe, ftype in members:
-        if ftype not in feat_cache:
-            feat_cache[ftype] = classify_feature_matrix(segments, ftype)
-        preds = pipe.predict(feat_cache[ftype])
-        for i, p in enumerate(preds):
-            ballots[i].append(str(p))
-    for seg, votes in zip(segments, ballots):
-        seg.label = Counter(votes).most_common(1)[0][0]
-
-
-def classify_segments(segments: list[Segment], model,
-                      feature_type: str = "hand") -> list[Segment]:
-    """Tag each segment with its predicted class label (stored on seg.label).
-    The fixed-layout key placement happens in build_instrument_drumkeys.
-
-    `model` is any fitted sklearn classifier exposing predict() over the feature
-    matrix selected by `feature_type`. Special case: feature_type=="ensemble"
-    means `model` is a list of (pipeline, feature_type) members to majority-vote.
-    Kept model-agnostic on purpose — pipeline.py must not import classifier.py
-    (that would be circular); the GUI passes the loaded model(s) in.
-    """
-    if not segments:
-        return segments
-    if feature_type == "ensemble":
-        _classify_ensemble(segments, model)
-        return segments
-    X = classify_feature_matrix(segments, feature_type)
-    preds = model.predict(X)
-    for seg, p in zip(segments, preds):
-        seg.label = str(p)
-    return segments
 
 
 # ---- Stage 2: CLAP-sort finished clusters onto drum types (no classifier) ----
@@ -1115,52 +1024,6 @@ def clap_sort_clusters(segments: list[Segment],
     return info
 
 
-def build_instrument_drumkeys_by_cluster(
-    segments: list[Segment], n_keys: int = MAX_KEYS) -> Instrument:
-    """Place whole CLUSTERS onto the drum kit by their consensus type.
-
-    Unlike build_instrument_drumkeys (which round-robins individual slices and
-    so mixes clusters), this keeps each cluster intact: every cluster lands as a
-    unit on a key of its type. When a type has several clusters, they spread
-    across that type's keys (largest cluster first), so e.g. two snare-ish
-    clusters take SNR1 and SNR2 rather than being blended.
-    """
-    if not segments:
-        return Instrument()
-    clusters: dict[int, list[Segment]] = {}
-    for s in segments:
-        if s.cluster == OUTLIER_CLUSTER:
-            continue  # outliers get no key
-        clusters.setdefault(s.cluster, []).append(s)
-
-    # Group clusters by their (shared) consensus label.
-    by_label: dict[str, list[list[Segment]]] = {}
-    for segs in clusters.values():
-        by_label.setdefault(segs[0].label, []).append(segs)
-
-    by_key: dict[int, list[Segment]] = {}
-    for label, clist in by_label.items():
-        keys = CLASS_KEYS.get(label)
-        if not keys:
-            continue  # type with no key on this layout — dropped
-        clist.sort(key=len, reverse=True)  # biggest cluster takes the first key
-        for i, segs in enumerate(clist):
-            k = keys[i % len(keys)]
-            for s in segs:
-                s.cluster = k
-            by_key.setdefault(k, []).extend(segs)
-
-    inst = Instrument()
-    for k, segs in by_key.items():
-        if 0 <= k < n_keys:
-            segs.sort(key=lambda s: s.rms)
-            inst.notes[k] = segs
-    inst.unassigned = sorted(
-        (s for s in segments if s.cluster == OUTLIER_CLUSTER),
-        key=lambda s: s.rms)
-    return inst
-
-
 def _cluster_family(segs: list[Segment]) -> str:
     """GM family for a whole cluster, from its (shared) leaf label."""
     leaf = segs[0].label if getattr(segs[0], "label", "") else ""
@@ -1228,36 +1091,6 @@ def build_instrument_drumkeys_gm(
     return inst
 
 
-def build_instrument_drumkeys(segments: list[Segment], n_keys: int = MAX_KEYS) -> Instrument:
-    """Lay predicted segments onto the fixed drum keyboard. Each class's samples
-    are distributed round-robin across the key(s) assigned to that class (e.g.
-    snares spread over SNR1/SNR2/SNR3), so every key holds a cyclable set."""
-    if not segments:
-        return Instrument()
-    by_class: dict[str, list[Segment]] = {}
-    for s in segments:
-        by_class.setdefault(s.label, []).append(s)
-
-    by_key: dict[int, list[Segment]] = {}
-    for cls, segs in by_class.items():
-        keys = CLASS_KEYS.get(cls)
-        if not keys:
-            continue  # class with no key on this layout — dropped
-        for i, s in enumerate(segs):
-            k = keys[i % len(keys)]
-            s.cluster = k
-            by_key.setdefault(k, []).append(s)
-
-    # No cluster-loudness pass: samples are peak-normalized individually at
-    # extraction, so they already play back at a consistent level.
-    inst = Instrument()
-    for k, segs in by_key.items():
-        if 0 <= k < n_keys:
-            segs.sort(key=lambda s: s.rms)
-            inst.notes[k] = segs
-    return inst
-
-
 def assign_keys_to_clusters(
     segments: list[Segment],
     sort_by_freq: bool = True,
@@ -1312,21 +1145,22 @@ def build_instrument(
 
 def run_pipeline(
     audio_path: str,
-    mode: str = "manual",
-    n_clusters: int = 8,
-    threshold: float = 5.0,
-    min_cluster_size: int = 3,
+    min_cluster_size: float = 3.0,
     sensitivity: float = 0.5,
     segment_length_s: float = SEGMENT_LENGTH_S,
     trim_threshold_db: float = TRIM_THRESHOLD_DB_DEFAULT,
     noise_gate_db: Optional[float] = None,
     n_keys: int = MAX_KEYS,
-    classifier_model=None,
-    classifier_feature_type: str = "hand",
     clap_sort: bool = False,          # Stage 2: CLAP-sort clusters onto drum keys
     clip_at_next_onset: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Instrument:
+    """Slice `audio_path` into samples and lay them out as an Instrument.
+
+    Stage 1 clusters the slices with HDBSCAN on the 57-dim features. Stage 2 is
+    optional: with `clap_sort`, CLAP labels each finished cluster and the kit
+    lands on the fixed GM drum layout; without it, clusters are ordered by pitch.
+    """
     def report(msg: str, frac: float) -> None:
         if progress_callback is not None:
             progress_callback(msg, frac)
@@ -1341,12 +1175,12 @@ def run_pipeline(
         return Instrument()
 
     # Feature window is ALWAYS decoupled from the played sample length:
-    #  - classify / CLAP-sort: a fixed CLASSIFY_FEATURE_LEN_S window (train/serve
-    #    consistency + CLAP's expected slice).
+    #  - CLAP-sort: a fixed CLASSIFY_FEATURE_LEN_S window (CLAP's expected slice,
+    #    and train/serve-consistent with how the models were fit).
     #  - pure clustering: the tuned CLUSTER_FEATURE_LEN_S window (short = best drum
     #    separation) — while the Sample Len slider only sets the PLAYED length, so
     #    long ring-outs (crashes, open hats) aren't chopped by the sort window.
-    feature_length_s = (CLASSIFY_FEATURE_LEN_S if (mode == "classify" or clap_sort)
+    feature_length_s = (CLASSIFY_FEATURE_LEN_S if clap_sort
                         else CLUSTER_FEATURE_LEN_S)
 
     report(f"Extracting {len(onsets)} segments…", 0.40)
@@ -1373,34 +1207,20 @@ def run_pipeline(
     n_kept = len(segments)
     n_dropped = len(onsets) - n_kept
 
+    # STAGE 1 — cluster first, on the hand-crafted feature space (NOT CLAP-space).
+    # CLAP is only applied afterward, in Stage 2, to NAME the finished clusters.
+    report(f"HDBSCAN on {n_kept} (57-dim, min size {min_cluster_size})…", 0.70)
+    cluster_segments_hdbscan(segments, min_cluster_size)
+
+    # STAGE 2 — CLAP-sort the finished clusters onto drum-kit keys.
     cluster_info = None  # set when CLAP types clusters for drum-kit placement
-    if mode == "classify":
-        report(f"Classifying {n_kept} segments…", 0.70)
-        classify_segments(segments, classifier_model, classifier_feature_type)
-    else:
-        # STAGE 1 — cluster first, on the current feature space (NOT CLAP-space).
-        # The clustering that already works stays exactly as-is; CLAP is only
-        # applied afterward, in Stage 2.
-        if mode == "hdbscan":
-            report(f"HDBSCAN on {n_kept} (57-dim, min size {min_cluster_size})…", 0.70)
-            cluster_segments_hdbscan(segments, min_cluster_size)
-        elif mode == "auto":
-            report(f"Agglomerative on {n_kept} (57-dim, threshold {threshold:.1f})…", 0.70)
-            cluster_segments_auto(segments, threshold)
-        else:
-            n_eff = max(1, min(n_clusters, n_kept))
-            report(f"KMeans on {n_kept} (57-dim, k={n_eff})…", 0.70)
-            cluster_segments(segments, n_eff)
-        # STAGE 2 — CLAP-sort the finished clusters onto drum-kit keys.
-        if clap_sort:
-            cluster_info = clap_sort_clusters(segments, progress=report)
+    if clap_sort:
+        cluster_info = clap_sort_clusters(segments, progress=report)
 
     n_clusters_found = len({s.cluster for s in segments
                             if s.cluster != OUTLIER_CLUSTER})
     report("Building instrument…", 0.90)
-    if mode == "classify":
-        instrument = build_instrument_drumkeys(segments, n_keys=n_keys)
-    elif cluster_info is not None:
+    if cluster_info is not None:
         # Auto-sorted clusters land ONE-PER-KEY on the GM layout by family.
         instrument = build_instrument_drumkeys_gm(segments, n_keys=n_keys)
     else:
@@ -1416,7 +1236,7 @@ def run_pipeline(
         if n_dedup > 0:
             bits.append(f"{n_dedup} dup")
         parts.append("(" + ", ".join(bits) + " dropped)")
-    grouping = "classes" if mode == "classify" else "clusters"
+    grouping = "clusters"
     parts.append(f"→ {n_clusters_found} {grouping} → {n_loaded} keys")
     parts.append(f"across {n_octaves} octave{'s' if n_octaves != 1 else ''}.")
     n_unassigned = len(instrument.unassigned)

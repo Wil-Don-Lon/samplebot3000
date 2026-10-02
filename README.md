@@ -218,8 +218,9 @@ audio file
 
 Clustering is deliberately stage 1 and label-free: grouping this kit's own sounds
 is a job the audio features already do well, and CLAP is applied afterward only to
-*name* the groups. HDBSCAN is the only clusterer in the GUI — KMeans and
-Agglomerative assume shapes that audio features don't have.
+*name* the groups. HDBSCAN is the only clusterer — KMeans and Agglomerative
+assume shapes that audio features don't have, and were removed. (KMeans survives
+as HDBSCAN's internal fallback for the rare input with no density structure.)
 
 **Feature windows are decoupled from SAMPLE LEN.** Clustering uses a fixed 0.7 s
 window, CLAP-labelling a fixed 0.5 s one. The slider only sets how much audio is
@@ -276,6 +277,12 @@ python fx_reject.py --method calibrated      # FX as open-set rejection
 
 Data helpers: `logic_import.py` (mine Logic's stock kits and your saved kits for
 training data), `datasets_loader.py`, `sort_samples.py`, `normalize_names.py`.
+
+These scripts load `models/*.joblib`; the app itself never does. `models/rf.joblib`
+(34 MB, superseded) is untracked — rebuild it with
+`python classifier.py --train --model rf`. Background on this line, including the
+evaluation methodology, is archived in
+[`docs/CLASSIFIER_IMPROVEMENT_BRIEF.md`](docs/CLASSIFIER_IMPROVEMENT_BRIEF.md).
 
 ---
 

@@ -34,3 +34,7 @@ superfluous junk/
 
 # Saved kits (user data)
 kits/
+
+# 34 MB RandomForest, superseded by the CLAP line and never loaded by the app.
+# Kept locally for classifier.py --compare; retrain with: python classifier.py --train --model rf
+models/rf.joblib
