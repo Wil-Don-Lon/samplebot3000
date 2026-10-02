@@ -136,7 +136,8 @@ cluster, apply, then move to the next.
 | **PER-SAMPLE EDIT** | off | Off, **VOLUME / ENVELOPE / FILTER** edits apply to the whole cluster on the selected key. On, they sculpt only the active sample. |
 
 **ENVELOPE** is a per-voice ADSR (default `0 ms / 0 ms / 1.00 / 2000 ms`, so
-samples ring out). **FILTER** is a per-voice lowpass (20 Hz – 20 kHz, log).
+samples ring out). **FILTER** is a per-voice lowpass, set by its **CUTOFF**
+knob (20 Hz – 20 kHz, log, open by default).
 **OCTAVE** (`◀ ▶`, or `Z` / `X`) moves the 17 visible keys across the full layout.
 
 Each voice captures its own envelope and cutoff at play time, so per-sample
@@ -247,7 +248,8 @@ audio_engine.py          output stream; per-voice ADSR + lowpass
 waveform_editor.py       per-sample trim / elongate view
 recategorize_dialog.py   drag-and-drop sample reassignment
 kit_store.py             save / load kits under kits/
-logic_export.py          EXS24 writer  (+ exs_templates.py: verified blocks)
+logic_export.py          EXS24 writer: zones, groups, round-robin, choke
+exs_templates.py         verbatim EXS24 blocks cloned from Logic's own file
 midi_input.py            USB MIDI in
 loudness.py              A-weighted equal-loudness gains
 piano_widget.py          keyboard painting + selection
@@ -267,7 +269,7 @@ LOMO is the metric throughout.
 
 ```bash
 python classifier.py --train --model clap    # train a supervised drum-type model
-python train_hybrid.py                       # cascade/flat hybrid per domain
+python train_hybrid.py --domain acoustic     # cascade/flat hybrid (--domain required)
 python autosort_bakeoff.py --domain acoustic # which features predict drum family
 python model_analysis.py                     # LOMO + random-vs-grouped gap
 python embed_eval.py --backend clap          # LOMO for CLAP embeddings
