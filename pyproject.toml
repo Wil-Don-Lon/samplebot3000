@@ -32,4 +32,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["main", "gui", "pipeline", "audio_engine", "piano_widget", "cluster_viewer", "adsr_widget", "classifier", "embedders", "moog_widgets"]
+# Flat layout: every top-level module must be listed or it is silently left out
+# of the built wheel. Keep in sync when adding a module (the app imports these by
+# bare name, so a missing entry breaks a non-editable install).
+py-modules = ["acoustic_eval", "adsr_widget", "audio_engine", "autosort_bakeoff",
+    "autosort_eval_kit", "classifier", "datasets_loader", "drum_data", "embed_eval",
+    "embedders", "exs_templates", "fx_reject", "gui", "hybrid_classifier", "kit_store",
+    "lexicon", "logic_export", "logic_import", "loudness", "main", "midi_input",
+    "model_analysis", "moog_widgets", "normalize_names", "piano_widget", "pipeline",
+    "preprocess_diag", "recategorize_dialog", "sort_samples", "train_hybrid",
+    "waveform_editor"]
